@@ -1,0 +1,10 @@
+node_modules/
+out/
+dist/
+coverage/
+.env
+.env.*
+!.env.example
+mcp.json
+*.local
+*.log
