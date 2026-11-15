@@ -39,7 +39,7 @@ const TOOLS: ToolDef[] = [
   CAPABILITY_TOOL,
   tool('fetch_url', '实际读取公开网页正文。搜索结果仅是候选，引用前用此工具打开来源；二进制文档须下载后读取。', { url: S }, ['url']),
   tool('ask_member', '请一位可直接连接的 API 成员给出独立观点、评估方案或检查论证。纯文字咨询，无需工作目录。提供具体问题和希望关注的角度。', { agent: S, task: S, acceptance: S }, ['agent', 'task', 'acceptance']),
-  tool('assign_task', '安排实际工作。只查资料或审阅时优先选 API 成员并用 read_only=true。指定 Gemini 时也可用 read_only=true，它会通过只读模式和应用工具处理。写清材料路径、产物位置和验收标准。可能已修改现场的失败任务先检查再续做。', { agent: S, task: S, acceptance: S, read_only: { type: 'boolean' }, retry_of: S }, ['agent', 'task', 'acceptance']),
+  tool('assign_task', '安排实际工作。根据成员的 kind（cli 适合本地文件/代码/脚本/PDF 加工；api 适合检索/分析/审阅）、runtime（模型/CLI 工具）、persona 与 busy 状态挑选最匹配且空闲的成员。只查资料或审阅优先选 API 成员并设 read_only=true（Gemini 也支持）。写清输入路径、产物位置和验收标准。', { agent: S, task: S, acceptance: S, read_only: { type: 'boolean' }, retry_of: S }, ['agent', 'task', 'acceptance']),
   tool('team_status', '查看本项目的实际任务与成员工作状态。结果会自动回来，不要轮询等待。', {}, []),
   tool('wait_for_team', '结束本轮并等待成员结果，软件会自动接续。用于无需再次向用户汇报的中间步骤。', {}, []),
   tool('list_files', '只读列出本会话成员工作目录的文件，默认共享工作目录。', { path: S }, []),
@@ -242,7 +242,16 @@ export class Manager {
     const input: AgentMsg[] = [{ role: 'system', content: [
       managerPolicy,
       `当前群聊：${room.name}。常规答复两三句，用户要求完整内容时按要求展开。用户点名成员时优先采纳。`,
-      `可用成员：${JSON.stringify(members.map((a) => ({ id: a.id, name: a.name, canGiveOpinion: a.kind === 'api', access: a.access ?? 'workspace', persona: a.persona?.slice(0, 600) })))}。要请本地成员参与，用 assign_task 指明只评估或需要实际执行什么。`,
+      `可用成员：${JSON.stringify(members.map((a) => ({
+        id: a.id,
+        name: a.name,
+        kind: a.kind,
+        runtime: a.kind === 'cli' ? (a.cli?.session && a.cli.session !== 'none' ? a.cli.session : a.cli?.command || 'cli') : a.model,
+        busy: p.tasks.some((other) => active(other) && other.agentId === a.id),
+        canGiveOpinion: a.kind === 'api',
+        access: a.access ?? 'workspace',
+        persona: a.persona?.slice(0, 600)
+      })))}。选人时对照任务类型、成员 runtime/kind/persona/capabilities 与 busy 状态择优指派；用户点名成员时优先采纳。请本地成员参与时用 assign_task 指明只评估或需要实际执行什么。`,
       this.host.capabilities ? `当前能力记录：${await this.host.capabilities(p.roomId, undefined, signal)}` : '',
       `获准的工作目录：${JSON.stringify(roots)}。相对路径默认第一个目录。交付副本由软件保存，保留源文件。`
     ].join('\n') }, { role: 'user', content: `触发原因：${reason}\n项目需求：${p.request}\n本会话近期交付副本：${JSON.stringify(recentDeliveries)}\n实际分工和回报：${JSON.stringify(p.tasks.map((task) => ({ ...task, task: task.task.slice(0, 1600), result: task.result?.slice(0, 3500) })))}\n本会话最近消息：\n${history.map((m) => `[${m.senderId === 'user' ? '用户' : m.senderName}] ${m.text.slice(0, 2200)}${m.attachments?.map((a) => `\n附件 ${a.name} (${a.path}): ${a.text?.slice(0, 7000) ?? '未提取到文字，需成员实际读取'}`).join('') ?? ''}`).join('\n').slice(-26000)}` }]

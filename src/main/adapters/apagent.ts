@@ -1,6 +1,6 @@
-import { spawn } from 'node:child_process'
-import { lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
-import { dirname, isAbsolute, resolve } from 'node:path'
+import { execFileSync, spawn } from 'node:child_process'
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
+import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { REPLY_STYLE, type Provider, type ReasoningEffort } from '../../shared/types'
 import { chatOnce, type AgentMsg, type ContentPart, type ToolCall, type ToolDef } from './openai'
 import { describeTool } from './humanize'
@@ -12,7 +12,7 @@ import { imageInputError, visualMessage, viewVisualFile, VISUAL_TOOLS, type Visu
 import { executeFileTool, FILE_TOOLS, FILE_TOOL_NAMES } from './fileTools'
 import { searchWeb, WEB_SEARCH_TOOL } from './webSearch'
 
-const MAX_STEPS = 20
+const MAX_STEPS = 30
 const MAX_LITERATURE_SEARCHES = 3
 
 const TOOLS: ToolDef[] = [
@@ -98,12 +98,13 @@ const TOOLS: ToolDef[] = [
     type: 'function',
     function: {
       name: 'run_command',
-      description: '在工作目录执行命令，说明用途和操作对象。应用会按权限自动审核或请求用户批准，获准后才执行。',
+      description: '在工作目录执行命令，说明用途和操作对象。Windows 默认优先使用 Git Bash（支持 bash 语法与 Unix 工具），需要 cmd 语法时可传 shell="cmd"。应用会按权限自动审核或请求用户批准，获准后才执行。',
       parameters: {
         type: 'object',
         properties: {
           command: { type: 'string', description: '要执行的命令' },
-          reason: { type: 'string', description: '这条命令要做什么、为什么需要执行' }
+          reason: { type: 'string', description: '这条命令要做什么、为什么需要执行' },
+          shell: { type: 'string', enum: ['bash', 'cmd'], description: '可选：默认 bash（Git Bash）；仅在必须用 Windows cmd 语法时传 cmd' }
         },
         required: ['command', 'reason']
       }
@@ -219,9 +220,10 @@ async function executeTool(
       signal.throwIfAborted()
       if (!ok) throw new Error('命令未获批准。可以改用其他已提供的工具。')
     }
+    const shellPref = args.shell === 'cmd' ? 'cmd' : args.shell === 'bash' ? 'bash' : undefined
     return await mutate(() => {
       onLog('tool', describeTool(name, args))
-      return runShellCommand(workDir, cmd, signal)
+      return runShellCommand(workDir, cmd, signal, shellPref)
     })
   }
   if (name === 'recall_context') {
@@ -234,14 +236,62 @@ async function executeTool(
   throw new Error(`未知工具: ${name}`)
 }
 
-export function runShellCommand(workDir: string, command: string, signal: AbortSignal): Promise<string> {  return new Promise((resolveP) => {
+let cachedGitBash: string | null | undefined
+
+/** 查找 Windows 上的 Git Bash（bin/bash.exe），未安装时回退默认 shell */
+export function findGitBash(): string | null {
+  if (process.platform !== 'win32') return null
+  if (cachedGitBash !== undefined) return cachedGitBash
+  const candidates = [
+    process.env.GIT_BASH_PATH,
+    process.env.ProgramFiles ? join(process.env.ProgramFiles, 'Git', 'bin', 'bash.exe') : '',
+    process.env['ProgramFiles(x86)'] ? join(process.env['ProgramFiles(x86)'], 'Git', 'bin', 'bash.exe') : '',
+    process.env.LocalAppData ? join(process.env.LocalAppData, 'Programs', 'Git', 'bin', 'bash.exe') : '',
+    'C:\\Program Files\\Git\\bin\\bash.exe',
+    'C:\\Program Files (x86)\\Git\\bin\\bash.exe'
+  ].filter((p): p is string => Boolean(p))
+  for (const p of candidates) {
+    if (existsSync(p)) return (cachedGitBash = p)
+  }
+  try {
+    const out = execFileSync('where.exe', ['git.exe'], { encoding: 'utf8', windowsHide: true, timeout: 2000 })
+    for (const line of out.split(/\r?\n/)) {
+      const trimmed = line.trim()
+      if (!trimmed) continue
+      const bashPath = resolve(dirname(trimmed), '..', 'bin', 'bash.exe')
+      if (existsSync(bashPath)) return (cachedGitBash = bashPath)
+    }
+  } catch {
+    // 未找到 git.exe 时回退到系统默认 shell
+  }
+  return (cachedGitBash = null)
+}
+
+export function runShellCommand(
+  workDir: string,
+  command: string,
+  signal: AbortSignal,
+  preferredShell?: 'bash' | 'cmd'
+): Promise<string> {
+  return new Promise((resolveP) => {
     signal.throwIfAborted()
-    const child = spawn(command, {
-      cwd: workDir,
-      shell: true,
-      windowsHide: true,
-      env: process.env
-    })
+    const gitBash = preferredShell === 'cmd' ? null : findGitBash()
+    const child = gitBash
+      ? spawn(gitBash, ['-c', command], {
+          cwd: workDir,
+          windowsHide: true,
+          env: {
+            ...process.env,
+            LANG: process.env.LANG || 'C.UTF-8',
+            PYTHONIOENCODING: process.env.PYTHONIOENCODING || 'utf-8'
+          }
+        })
+      : spawn(command, {
+          cwd: workDir,
+          shell: true,
+          windowsHide: true,
+          env: process.env
+        })
     let out = ''
     let settled = false
     const finish = (text: string): void => {
@@ -335,12 +385,13 @@ export async function runApiAgent(opts: {
       ? '- 任务需要改动文件或执行命令时，说明你受只读权限限制，并给出具体方案。'
       : '- 用 write_file 创建或覆盖文件；路径一律用相对工作目录的路径（完全/完全+审批/自动审查权限可用绝对路径）。',
     access === 'auto-review'
-      ? '- 需要执行命令时，用 run_command 说明用途、操作路径与当前任务的关系。运行脚本前先读取相关脚本和配置；常规检索、生成成果、修改指定项目和运行检查直接推进，不额外口头询问是否开始。'
-      : (access === 'workspace' || access === 'full-approval') ? '- 确实需要执行命令时，先用 run_command 说明用途并申请批准。' : '',
+      ? '- 需要执行命令时，用 run_command（Windows 默认提供 Git Bash，可用 bash 语法，也支持传 shell="cmd"）说明用途、操作路径与当前任务的关系。运行脚本前先读取相关脚本和配置；常规检索、生成成果、修改指定项目和运行检查直接推进，不额外口头询问是否开始。'
+      : (access === 'workspace' || access === 'full-approval') ? '- 确实需要执行命令时，先用 run_command（Windows 默认提供 Git Bash，可用 bash 语法，也支持 shell="cmd"）说明用途并申请批准。' : '',
     ...(opts.literature ? [
       '- 实际调用 search_literature 检索论文和综述。沿用前情里的已确认主题和年份，只传公开检索词。先查一轮，必要时换词，总计最多三次。Crossref 返回的是候选书目信息，只列结果里的文献和 DOI，按实际核实程度说明。'
     ] : []),
     '- 只有工具结果证明做过的操作才能写入总结。命令未获批准、工具报错或未调用时，说明实际进度，不能编造网页、退出码、HTTP 状态或文献。',
+    access !== 'readonly' ? '- 需要用脚本处理与核验时，尽量用 write_file 写好脚本后一次 run_command 完成执行与校验，避免拆成大量零散小命令。' : '',
     '- 每步简短说明你在做什么，别长篇大论。',
     REPLY_STYLE
   ].filter(Boolean).join('\n')

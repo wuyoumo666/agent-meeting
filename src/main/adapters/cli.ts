@@ -42,7 +42,7 @@ const AGENTIC_PROMPT =
   '- 常规步骤自行决定并完成，不反复问是否开始。用户只问进度、原因或概念时，必要核对后先回答，不擅自重启旧待办。\n' +
   '- 能力以本轮实际工具列表为准。查文献用 agent_meeting/search_literature，打开网页用 fetch_url，需要保存才用 download_file；不要声称有未提供的 shell、搜索或浏览器。\n' +
   '- 图片用 agent_meeting/view_image，PDF 视觉检查用 view_pdf 并指定 page。工具返回实际画面，只读任务也可用。仅检查过的图片或页码可称已完成视觉检查；不要用文本工具读取图片二进制。\n' +
-  '- 需要跑命令时用 agent_meeting 的 run_command（会审批/自动审查），不要因为“没有 Bash”就停下来。\n' +
+  '- 需要跑命令时用 agent_meeting 的 run_command（会审批/自动审查；Windows 默认提供 Git Bash，可用 bash 语法，需要 cmd 时传 shell="cmd"），不要因为“没有 Bash”就停下来。跑脚本或批量核对时尽量合并为一次脚本或单条组合命令，减少碎片化调用。\n' +
   '- PDF/Word 正文用 read_document，找文件用 find_files、搜索内容用 search_files，无需为这些只读操作申请命令。read_file/read_document 有 nextLine/nextChar 时按 startLine/startChar 续读。网页搜索用 web_search，摘要需 fetch_url 核实；check_capabilities 查看同伴能力记录。\n' +
   '- 讨论中较大任务可以 start_work 排队。若已在工作区，直接完成，禁止再给自己排队。适合队友独立核验的部分用 delegate，交代材料、限制和输出；先用 team_status 避免撞任务。\n' +
   '- 派出任务后继续独立部分或结束本轮，结果会自动送回；禁止反复等待、轮询或循环转交。整合同伴成果前检查实际文件或来源。\n' +

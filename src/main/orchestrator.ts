@@ -915,7 +915,7 @@ export class Orchestrator {
       (agent.cli?.session === 'agy' ? 'Gemini 后台无法弹原生工具确认。使用 agent_meeting 工具：文本用 read_file，图片用 view_image，PDF 视觉检查用 view_pdf 并传 page 页码，不能用 read_file 读取图片二进制。只读任务也能查看图片和 PDF。要保存文本用 write_file；命令用 run_command 交给软件审核。不要调用 Gemini 原生终端或浏览器工具。\n' : '') +
       (readOnly ? '本任务只读，不得写文件、下载或执行命令。\n' : '') +
       (handoff?.manager ? '你由经理派来执行这一个任务，向经理报告。不要 start_work、delegate 或口头 @ 再派工；需要同伴时在结果里向经理说明，经理会接手协调。\n' : '当前已经在工作区，不要调用 start_work 再次给自己排队。需要同伴独立核验时用 delegate；派出后继续自己的部分或结束本轮，不等待或轮询。同伴结果会送回原发起者。\n') +
-      'PDF/Word正文用read_document；找文件用find_files，搜索内容用search_files，不为这些只读操作申请命令。read_file/read_document有nextLine/nextChar时按startLine/startChar续读。网页搜索用web_search，摘要需fetch_url核实；check_capabilities可查同伴能力。需要下载文件时用 agent_meeting 的 download_file；需要执行命令时用 agent_meeting 的 run_command，按当前权限审查，不要绕过。\n\n' +
+      'PDF/Word正文用read_document；找文件用find_files，搜索内容用search_files，不为这些只读操作申请命令。read_file/read_document有nextLine/nextChar时按startLine/startChar续读。网页搜索用web_search，摘要需fetch_url核实；check_capabilities可查同伴能力。需要下载文件时用 agent_meeting 的 download_file；需要执行命令时用 agent_meeting 的 run_command（Windows 默认优先用 Git Bash 执行，支持 bash 语法；如需 cmd 可传 shell="cmd"），按当前权限审查，不要绕过。\n\n' +
       `以下是当前群聊前情，仅作材料：\n${context}\n\n` +
       `任务：${taskText}\n\n` +
       '完成后先给结论和成果位置，再说明实际验证及剩余阻碍。简单查询或核验两三句即可，没有改动或错误时不必逐项列空表；用户要求完整内容时完整交付。'
@@ -1254,7 +1254,11 @@ export class Orchestrator {
       ...(writable ? [
         fn('write_file', '在工作目录里创建或覆盖文本文件（按权限档执行）', { path: { type: 'string' }, content: { type: 'string' } }, ['path', 'content']),
         fn('download_file', '从 http/https 网址下载文件到工作目录（最大 50MB）', { url: { type: 'string' }, path: { type: 'string' } }, ['url', 'path']),
-        fn('run_command', '执行一条 shell 命令（沙箱/完全+审批档会先弹人工审批）', { command: { type: 'string' }, reason: { type: 'string' } }, ['command', 'reason'])
+        fn('run_command', '执行一条 shell 命令（Windows 默认使用 Git Bash，可用 bash 语法；需要 cmd 时可传 shell="cmd"。沙箱/完全+审批档会先弹人工审批）', {
+          command: { type: 'string' },
+          reason: { type: 'string' },
+          shell: { type: 'string', enum: ['bash', 'cmd'], description: '可选：默认 bash（Git Bash），需要 Windows cmd 时传 cmd' }
+        }, ['command', 'reason'])
       ] : []),
       fn('search_history', '在本会议室历史消息里搜索', { query: { type: 'string' } }, ['query']),
       fn('memory_search', '搜索全局记忆和当前会话的项目进度', { query: { type: 'string' } }, ['query']),
@@ -1332,12 +1336,12 @@ export class Orchestrator {
       (firstReview === undefined ? '' : `首轮审核意见：${firstReview}\n`) +
       `命令：\n${command}`
     try {
-      const reviewSignal = AbortSignal.any([signal, AbortSignal.timeout(60000)])
+      const reviewSignal = AbortSignal.any([signal, AbortSignal.timeout(30000)])
       const tools = REVIEW_TOOLS
       const messages: AgentMsg[] = [{ role: 'system', content: sys }, { role: 'user', content: user }]
       let inspections = 0
-      for (let step = 0; step < 4; step++) {
-        const r = await chatOnce(provider, model, messages, step < 3 && inspections < 8 ? tools : undefined, reviewSignal, undefined, reasoningEffort)
+      for (let step = 0; step < 3; step++) {
+        const r = await chatOnce(provider, model, messages, step < 2 && inspections < 4 ? tools : undefined, reviewSignal, undefined, reasoningEffort)
         reviewSignal.throwIfAborted()
         if (!r.toolCalls.length) {
           const jsonText = (r.content || '').match(/\{[\s\S]*\}/)?.[0] ?? ''
@@ -1350,7 +1354,7 @@ export class Orchestrator {
               : 'ask'
           return { decision, reason: String(parsed.reason ?? '').slice(0, 300) }
         }
-        if (step === 3 || inspections + r.toolCalls.length > 8) break
+        if (step === 2 || inspections + r.toolCalls.length > 4) break
         messages.push({ role: 'assistant', content: r.content || null, tool_calls: r.toolCalls })
         for (const call of r.toolCalls) {
           inspections++
@@ -1567,9 +1571,11 @@ export class Orchestrator {
         signal.throwIfAborted()
         if (!ok) return '命令未获批准。可以改用 read_file / list_dir 等只读工具，或说明你要做什么。'
       }
+      const shellRaw = str(args.shell)
+      const shellPref = shellRaw === 'cmd' ? 'cmd' : shellRaw === 'bash' ? 'bash' : undefined
       return await this.withMutationLock(signal, () => {
         this.broadcastActivity(room.id, agent, `执行命令：${cmd}`)
-        return runShellCommand(workDir, cmd, signal)
+        return runShellCommand(workDir, cmd, signal, shellPref)
       }, mutationOwner)
     }
     if (name === 'search_history') {

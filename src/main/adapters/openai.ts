@@ -31,11 +31,11 @@ export interface AgentMsg {
 }
 
 const normBase = (baseUrl: string): string => baseUrl.trim().replace(/\/+$/, '')
-const MODEL_REQUEST_TIMEOUT_MS = 120_000
+const MODEL_REQUEST_TIMEOUT_MS = 180_000
 
 export class ModelRequestTimeoutError extends Error {
   constructor() {
-    super('模型服务本次请求超过 2 分钟没有完成，已结束等待。')
+    super('模型服务本次请求超过 3 分钟没有完成，已结束等待。')
     this.name = 'ModelRequestTimeoutError'
   }
 }

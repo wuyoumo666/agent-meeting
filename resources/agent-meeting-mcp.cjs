@@ -83,13 +83,14 @@ const TOOLS = [
   },
   {
     name: 'run_command',
-    description: '执行一条 shell 命令，说明用途；应用按当前权限自动审查或请求用户批准，获准后执行。' +
+    description: '执行一条 shell 命令，说明用途（Windows 默认使用 Git Bash，可用 bash 语法与常用 Unix 工具；仅需 Windows cmd 时传 shell="cmd"）。应用按当前权限自动审查或请求用户批准，获准后执行。' +
       (COMMAND_WAIT ? '若仍在等待，请调用 wait_command 取回同一条命令的结果。' : ''),
     inputSchema: {
       type: 'object',
       properties: {
         command: { type: 'string', description: '要执行的命令' },
-        reason: { type: 'string', description: '为什么需要执行、要做什么' }
+        reason: { type: 'string', description: '为什么需要执行、要做什么' },
+        shell: { type: 'string', enum: ['bash', 'cmd'], description: '可选：默认 bash（Git Bash）；仅在需要 Windows cmd 语法时传 cmd' }
       },
       required: ['command', 'reason']
     }

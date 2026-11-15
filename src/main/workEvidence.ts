@@ -34,8 +34,9 @@ export function accessedPage(url: unknown): WorkSource | undefined {
 export function workFailure(error: unknown): { reason: string; transient: boolean } {
   const message = error instanceof Error ? error.message : String(error)
   const status = /(?:HTTP\s+|(?:^|\s)\()([45]\d{2})\b/i.exec(message)?.[1]
-  if (/模型服务本次请求超过 2 分钟没有完成/.test(message)) {
-    return { reason: '模型服务在 2 分钟内未返回完整回复。', transient: true }
+  const timeoutMatch = /模型服务本次请求超过 (\d+) 分钟没有完成/.exec(message)
+  if (timeoutMatch) {
+    return { reason: `模型服务在 ${timeoutMatch[1]} 分钟内未返回完整回复。`, transient: true }
   }
   if (/insufficient[ _-](?:account[ _-])?(?:balance|credits?)|credit balance.*(?:low|empty|insufficient)|余额不足/i.test(message)) {
     return { reason: '模型服务账户余额不足，请充值或更换模型服务。', transient: false }

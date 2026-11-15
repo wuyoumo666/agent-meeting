@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, nativeTheme, shell } from 'electron'
+import { app, BrowserWindow, Menu, Tray, dialog, ipcMain, nativeImage, nativeTheme, shell } from 'electron'
 import { join, basename, extname } from 'node:path'
 import { copyFile, readFile, stat, writeFile } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
@@ -14,11 +14,97 @@ import { OPENABLE_DELIVERY, verifyDelivery } from './managerFiles'
 import type { Agent, AppEvent, Attachment, ModeratorUpdate, ProviderUpdate, Room, RulesFile, ScheduledTask } from '../shared/types'
 
 let win: BrowserWindow | null = null
+let tray: Tray | null = null
+let isQuitting = false
+let trayBalloonShown = false
+let minimizeHideTimer: NodeJS.Timeout | null = null
+let lastShownAt = 0
 let store: Store
 let orchestrator: Orchestrator
 let toolBridge: ToolBridge | null = null
 let eventRevision = 0
 const approvalAlert = new ApprovalAlert(() => store?.getApprovalSound() ?? true, () => shell.beep())
+
+// 防止 Windows 下隐藏到托盘再恢复时，Chromium 原生遮挡检测卡死窗口渲染和点击事件
+app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion')
+
+const gotSingleInstanceLock = app.requestSingleInstanceLock()
+if (!gotSingleInstanceLock) {
+  app.quit()
+}
+
+function getAppIconPath(): string {
+  return join(app.getAppPath(), 'resources', process.platform === 'win32' ? 'bubble-icon.ico' : 'icon.png')
+}
+
+function clearMinimizeHideTimer(): void {
+  if (!minimizeHideTimer) return
+  clearTimeout(minimizeHideTimer)
+  minimizeHideTimer = null
+}
+
+function showMainWindow(): void {
+  clearMinimizeHideTimer()
+  lastShownAt = Date.now()
+  if (!win || win.isDestroyed()) {
+    createWindow()
+    return
+  }
+  if (!win.isVisible()) win.show()
+  if (win.isMinimized()) win.restore()
+  win.moveTop()
+  win.focus()
+  win.webContents.focus()
+  win.webContents.invalidate()
+}
+
+function hideToTray(): void {
+  clearMinimizeHideTimer()
+  if (!win || win.isDestroyed() || isQuitting) return
+  win.hide()
+  if (process.platform === 'win32' && tray && !trayBalloonShown) {
+    trayBalloonShown = true
+    tray.displayBalloon({
+      iconType: 'info',
+      title: '我的智囊团已收起至系统托盘',
+      content: '点击右下角托盘图标可随时恢复，右键菜单可彻底退出。'
+    })
+  }
+}
+
+function createTray(): void {
+  if (tray) return
+  const icon = nativeImage.createFromPath(getAppIconPath())
+  tray = new Tray(icon)
+  tray.setToolTip('我的智囊团')
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: '显示主界面', click: () => showMainWindow() },
+    { type: 'separator' },
+    {
+      label: '退出我的智囊团',
+      click: () => {
+        isQuitting = true
+        app.quit()
+      }
+    }
+  ]))
+  tray.on('click', () => {
+    if (!win || win.isDestroyed() || !win.isVisible() || win.isMinimized()) {
+      showMainWindow()
+      return
+    }
+    if (Date.now() - lastShownAt < 500) {
+      showMainWindow()
+      return
+    }
+    if (win.isFocused()) {
+      hideToTray()
+    } else {
+      showMainWindow()
+    }
+  })
+  tray.on('double-click', () => showMainWindow())
+}
 
 const broadcast = (ev: AppEvent): void => {
   approvalAlert.accept(ev)
@@ -46,14 +132,31 @@ function createWindow(): void {
     minWidth: 600,
     minHeight: 600,
     title: '我的智囊团',
-    icon: join(app.getAppPath(), 'resources', process.platform === 'win32' ? 'bubble-icon.ico' : 'icon.png'),
+    icon: getAppIconPath(),
     autoHideMenuBar: true,
     backgroundColor: '#ffffff',
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       contextIsolation: true,
-      nodeIntegration: false
+      nodeIntegration: false,
+      backgroundThrottling: false
     }
+  })
+  win.on('minimize', () => {
+    clearMinimizeHideTimer()
+    minimizeHideTimer = setTimeout(() => {
+      minimizeHideTimer = null
+      if (win && !win.isDestroyed() && win.isMinimized() && !isQuitting) hideToTray()
+    }, 120)
+  })
+  win.on('restore', () => {
+    clearMinimizeHideTimer()
+    if (win && !win.isDestroyed()) win.webContents.invalidate()
+  })
+  win.on('close', (event) => {
+    if (isQuitting) return
+    event.preventDefault()
+    hideToTray()
   })
   win.webContents.setWindowOpenHandler(({ url }) => {
     if (/^https?:\/\//i.test(url)) void shell.openExternal(url)
@@ -314,34 +417,43 @@ function registerIpc(): void {
   })
 }
 
-app.whenReady().then(async () => {
-  nativeTheme.themeSource = 'light'
-  store = new Store()
-  await store.loadCredentials()
-  orchestrator = new Orchestrator(store, broadcast)
-  try {
-    toolBridge = await startToolBridge(orchestrator, {
-      userData: app.getPath('userData'),
-      appPath: app.getAppPath()
+if (gotSingleInstanceLock) {
+  app.on('second-instance', () => showMainWindow())
+
+  app.whenReady().then(async () => {
+    nativeTheme.themeSource = 'light'
+    store = new Store()
+    await store.loadCredentials()
+    orchestrator = new Orchestrator(store, broadcast)
+    try {
+      toolBridge = await startToolBridge(orchestrator, {
+        userData: app.getPath('userData'),
+        appPath: app.getAppPath()
+      })
+      orchestrator.setToolBridge(toolBridge)
+    } catch (e) {
+      console.error('[bridge] 本地工具桥启动失败，CLI 将只能用自己的工具：', e)
+    }
+    orchestrator.resumePendingWork()
+    registerIpc()
+    createTray()
+    createWindow()
+    app.on('activate', () => {
+      showMainWindow()
     })
-    orchestrator.setToolBridge(toolBridge)
-  } catch (e) {
-    console.error('[bridge] 本地工具桥启动失败，CLI 将只能用自己的工具：', e)
-  }
-  orchestrator.resumePendingWork()
-  registerIpc()
-  createWindow()
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow()
   })
-})
+}
 
 app.on('window-all-closed', () => {
+  if (!isQuitting && tray) return
   toolBridge?.close()
   store?.flushNow()
   if (process.platform !== 'darwin') app.quit()
 })
 app.on('before-quit', () => {
+  isQuitting = true
+  tray?.destroy()
+  tray = null
   toolBridge?.close()
   store?.flushNow()
 })
