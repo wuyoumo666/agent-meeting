@@ -783,7 +783,7 @@ export default function Chat(props: Props): React.JSX.Element {
                       : `这里是独立纯聊天区，不触发经理和工作区派活，轻松把 ${room.name} 当聊天 AI 玩。`)
                     : (participants.length
                       ? '纯聊天群已就绪：成员之间不会触发经理派活，可以点上方 @成员 或 📢 全体 一起开聊！'
-                      : '在「成员」里拉入 AI 成员，即可开始群聊或《AI情公寓》同台互动。')}
+                      : '在「成员」里拉入 AI 成员，即可开始群聊互动。')}
                 </p>
                 {participants.length > 0 && (
                   <button className="ghost-btn" style={{ marginTop: 6 }} onClick={() => setPersonaOpen(true)}>

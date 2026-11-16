@@ -21,8 +21,8 @@ export default function RoomModal({ room, defaultKind = 'group', agents, onClose
   const toggle = (id: string): void =>
     setIds((cur) => (cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id]))
 
-  const applyApartmentPreset = (): void => {
-    if (!name.trim()) setName('AI情公寓客厅')
+  const applyQuickGroupPreset = (): void => {
+    if (!name.trim()) setName('随便聊聊')
     setIds(agents.filter((a) => a.kind !== 'demo').map((a) => a.id))
   }
 
@@ -55,11 +55,11 @@ export default function RoomModal({ room, defaultKind = 'group', agents, onClose
           <button className="icon-btn" disabled={saving} aria-label="关闭房间设置" onClick={onClose}>×</button>
         </div>
         <div className="modal-body form">
-          <label>{isPureGroup ? '聊天群名称' : '房间名'}<input autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder={isPureGroup ? '如：AI情公寓客厅' : '如：方案评审'} /></label>
+          <label>{isPureGroup ? '聊天群名称' : '房间名'}<input autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder={isPureGroup ? '如：茶话会 / 摸鱼闲聊' : '如：方案评审'} /></label>
           {!room && isPureGroup && agents.some((a) => a.kind !== 'demo') && (
             <div className="form-row">
-              <button type="button" className="ghost-btn" onClick={applyApartmentPreset}>
-                🏠 一键填好：AI情公寓客厅（拉入全员）
+              <button type="button" className="ghost-btn" onClick={applyQuickGroupPreset}>
+                ✨ 一键填好：全员聊天群
               </button>
             </div>
           )}

@@ -12,7 +12,9 @@ interface Props {
 export default function PersonaPicker({ agents, initialAgentId, onSaveAgent, onClose }: Props): React.JSX.Element {
   const [selectedId, setSelectedId] = useState(initialAgentId && agents.some((a) => a.id === initialAgentId) ? initialAgentId : (agents[0]?.id ?? ''))
   const currentAgent = agents.find((a) => a.id === selectedId) ?? agents[0]
-  const [customDraft, setCustomDraft] = useState(currentAgent?.chatPersona ?? '')
+  const [customDraft, setCustomDraft] = useState(
+    currentAgent?.chatPersona ?? findPersonaPreset(currentAgent?.chatPreset)?.prompt ?? ''
+  )
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
 
@@ -30,7 +32,7 @@ export default function PersonaPicker({ agents, initialAgentId, onSaveAgent, onC
 
   const selectAgent = (agent: Agent): void => {
     setSelectedId(agent.id)
-    setCustomDraft(agent.chatPersona ?? '')
+    setCustomDraft(agent.chatPersona ?? findPersonaPreset(agent.chatPreset)?.prompt ?? '')
     setError('')
   }
 
@@ -40,13 +42,13 @@ export default function PersonaPicker({ agents, initialAgentId, onSaveAgent, onC
     const next: Agent = {
       ...currentAgent,
       chatPreset: presetId || undefined,
-      chatPersona: preset ? preset.prompt : presetId === 'custom' ? customDraft : undefined
+      chatPersona: preset ? undefined : presetId === 'custom' ? customDraft : undefined
     }
     setSaving(true)
     setError('')
     try {
       await onSaveAgent(next)
-      if (preset) setCustomDraft(preset.prompt)
+      setCustomDraft(preset ? preset.prompt : '')
     } catch {
       setError('保存人设失败，请重试。')
     } finally {
@@ -57,13 +59,15 @@ export default function PersonaPicker({ agents, initialAgentId, onSaveAgent, onC
   const saveCustomText = async (): Promise<void> => {
     if (saving) return
     const trimmed = customDraft.trim()
-    const nextPreset = currentAgent.chatPreset && findPersonaPreset(currentAgent.chatPreset)
+    const preset = findPersonaPreset(currentAgent.chatPreset)
+    const nextPreset = preset
       ? currentAgent.chatPreset
       : (trimmed ? 'custom' : undefined)
+    const nextPersona = preset && trimmed === preset.prompt.trim() ? undefined : (trimmed || undefined)
     setSaving(true)
     setError('')
     try {
-      await onSaveAgent({ ...currentAgent, chatPreset: nextPreset, chatPersona: trimmed || undefined })
+      await onSaveAgent({ ...currentAgent, chatPreset: nextPreset, chatPersona: nextPersona })
     } catch {
       setError('保存人设失败，请重试。')
     } finally {
@@ -139,7 +143,7 @@ export default function PersonaPicker({ agents, initialAgentId, onSaveAgent, onC
         <div className="persona-custom-head">
           <span className="dim small">
             {activePreset
-              ? `当前内置《AI情公寓》· ${activePreset.name}（已自动附带共用前缀与室友关系，可微调正文）`
+              ? `当前内置《AI情公寓》性格 · ${activePreset.name}（只含性格与口癖、不强制演固定场景，可微调）`
               : '自定义聊天人设（可自由编写性格与说话风格）'}
           </span>
           {activePreset && customDraft.trim() !== activePreset.prompt.trim() && (
@@ -159,7 +163,7 @@ export default function PersonaPicker({ agents, initialAgentId, onSaveAgent, onC
           {error && <span className="composer-error">{error}</span>}
           <button
             className="primary-btn"
-            disabled={saving || customDraft.trim() === (currentAgent.chatPersona ?? '').trim()}
+            disabled={saving || customDraft.trim() === (currentAgent.chatPersona ?? activePreset?.prompt ?? '').trim()}
             onClick={() => void saveCustomText()}
           >
             {saving ? '保存中…' : '保存设定'}

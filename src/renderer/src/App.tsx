@@ -484,7 +484,7 @@ export default function App(): React.JSX.Element {
                   <button className="room-del icon-btn" aria-label={`删除聊天群 ${r.name}`} title="删除聊天群" onClick={() => confirmDeleteRoom(r)}>×</button>
                 </div>
               ))}
-              {chatGroups.length === 0 && <p className="side-hint dim">点上方「新建聊天群」，可一键拉起《AI情公寓客厅》</p>}
+              {chatGroups.length === 0 && <p className="side-hint dim">还没有聊天群，点上方「新建聊天群」可拉大家一起聊</p>}
             </nav>
             <div className="side-section">
               <span>各个 AI · 单聊</span><span className="side-count">{chatDmAgents.length}</span>

@@ -535,21 +535,23 @@ function RulesForm({ value, onSave }: { value: RulesFile; onSave: (r: RulesFile)
   )
 }
 
-function ModelPicker({ value, models, onChange, disabled }: {
+function ModelPicker({ value, models, onChange, disabled, label = '模型', emptyLabel = '选择模型' }: {
   value: string
   models: string[]
   onChange: (model: string) => void
   disabled?: boolean
+  label?: string
+  emptyLabel?: string
 }): React.JSX.Element {
   const [custom, setCustom] = useState(false)
   const options = [...new Set([...models, value].filter(Boolean))]
   return <>
-    <label>模型
-      <select aria-label="模型" disabled={disabled} value={custom ? '__custom__' : value} onChange={(event) => {
+    <label>{label}
+      <select aria-label={label} disabled={disabled} value={custom ? '__custom__' : value} onChange={(event) => {
         if (event.target.value === '__custom__') setCustom(true)
         else { setCustom(false); onChange(event.target.value) }
       }}>
-        <option value="">选择模型</option>
+        <option value="">{emptyLabel}</option>
         {options.map((model) => <option key={model} value={model}>{model}</option>)}
         <option value="__custom__">自定义输入…</option>
       </select>
@@ -604,9 +606,9 @@ function ModeratorForm({ value, providers, onSave }: { value: ModeratorSettings;
         </label>
         <label className="check-row">
           <input type="checkbox" checked={cfg.reviewCommands !== false} onChange={(e) => update({ reviewCommands: e.target.checked })} />
-          <span>让经理复审自动审核未通过的命令</span>
+          <span>让经理终审快速审查未直接放行的命令</span>
         </label>
-        <p className="dim small">开启后，经理可复审并批准任务内的检索、文件生成、项目修改和运行检查。仍有重大影响或授权缺口时才请你确认。</p>
+        <p className="dim small">开启后，快速副模型或成员拿不准的命令会自动升级给经理主模型做最终裁决并尽量自动放行，减少弹窗等待人工确认。</p>
       </div>
       <label>模型服务
         <select aria-label="主持人的模型服务" disabled={fetching || saving} value={cfg.providerId ?? ''} onChange={(event) => {
@@ -633,7 +635,7 @@ function ModeratorForm({ value, providers, onSave }: { value: ModeratorSettings;
         <ModelPicker key={cfg.providerId ?? 'custom'} value={cfg.model} models={models} disabled={fetching || saving} onChange={(model) => update({ model })} />
         <ReasoningSelect value={cfg.reasoningEffort} onChange={(reasoningEffort) => update({ reasoningEffort })} />
       </div>
-      <p className="dim small">思考强度单独保存，支持的档位以模型服务为准。</p>
+      <p className="dim small">经理每次派单、复审命令和验收交付都会调用该模型；建议思考强度选「默认」或「低/中」，设为「高」以上会显著拉长每轮等待时间。</p>
       {cfg.providerId
         ? <p className="dim small">使用所选模型服务的地址和密钥。</p>
         : <KeyField stored={!value.providerId && value.hasApiKey} value={cfg.apiKey} onChange={(apiKey) => update({ apiKey })} />}
@@ -641,6 +643,43 @@ function ModeratorForm({ value, providers, onSave }: { value: ModeratorSettings;
         <button className="ghost-btn settings-secondary" onClick={() => void fetchM()} disabled={fetching || !cfg.baseUrl}>{fetching ? '获取中…' : '获取模型列表'}</button>
         <span className="dim small">{msg}</span>
       </div>
+
+      <section className="settings-block form" aria-labelledby="moderator-fast-section">
+        <h4 id="moderator-fast-section">快速副模型（可选 · 双模型分流提速）</h4>
+        <p className="dim small">
+          开启后：命令安全审查、成员中途例行跟进和记忆整理自动走快速模型（秒级响应）；需求规划与最终成品验收仍由上方主模型把关。
+        </p>
+        {(() => {
+          const fastProvider = providers.find((item) => item.id === cfg.fastProviderId)
+          const fastModels = cfg.fastProviderId ? (fastProvider?.models ?? []) : models
+          return (
+            <div className="settings-field-grid">
+              <label>快速模型服务
+                <select
+                  aria-label="快速模型服务"
+                  disabled={saving}
+                  value={cfg.fastProviderId ?? ''}
+                  onChange={(event) => update({ fastProviderId: event.target.value || undefined, fastModel: '' })}
+                >
+                  <option value="">同主持人主服务</option>
+                  {cfg.fastProviderId && !fastProvider && <option value={cfg.fastProviderId}>原服务已移除，请重选</option>}
+                  {providers.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
+                </select>
+              </label>
+              <ModelPicker
+                key={`fast-${cfg.fastProviderId ?? cfg.providerId ?? 'custom'}`}
+                label="快速副模型（如 Flash）"
+                emptyLabel="不启用（全流程使用主模型）"
+                value={cfg.fastModel ?? ''}
+                models={fastModels}
+                disabled={saving}
+                onChange={(fastModel) => update({ fastModel: fastModel || undefined })}
+              />
+            </div>
+          )
+        })()}
+      </section>
+
       <div className="form-actions">
         <button className="primary-btn" disabled={saving || fetching || (cfg.enabled && (!cfg.model.trim() || !cfg.baseUrl.trim() || (!!cfg.providerId && !provider)))} onClick={async () => {
           setSaving(true)
@@ -852,12 +891,12 @@ function AgentForm({ value, providers, moderator, onChange, onSave, onCancel }: 
                 onChange({
                   ...value,
                   chatPreset: id || undefined,
-                  chatPersona: preset ? preset.prompt : id === 'custom' ? (value.chatPersona ?? '') : undefined
+                  chatPersona: preset ? undefined : id === 'custom' ? (value.chatPersona ?? '') : undefined
                 })
               }}
             >
               <option value="">默认自然聊天（不使用特殊人设）</option>
-              <optgroup label="《AI情公寓》角色预设（自动附带共用设定与室友关系）">
+              <optgroup label="《AI情公寓》性格预设（只含性格口癖，不强制演场景）">
                 {PERSONA_PRESETS.map((p) => (
                   <option key={p.id} value={p.id}>{p.name}｜{p.aliases}</option>
                 ))}
@@ -872,19 +911,22 @@ function AgentForm({ value, providers, moderator, onChange, onSave, onCancel }: 
               <>
                 <p className="dim small">
                   {preset
-                    ? `「${preset.tagline}」—— 仅在「纯聊天」区生效，自动附带《AI情公寓》合租共用设定，不影响办公模式。`
-                    : '仅在「纯聊天」区域生效，可以挑选《AI情公寓》内置角色或自由编写性格，把成员当聊天 AI 玩。'}
+                    ? `「${preset.tagline}」—— 仅在「纯聊天」区生效，只注入性格与说话方式、不带场景旁白，不影响办公模式。`
+                    : '仅在「纯聊天」区域生效，可以挑选《AI情公寓》性格预设或自由编写，把成员当聊天 AI 玩。'}
                 </p>
                 {showTextarea && (
                   <>
                     <textarea
                       rows={5}
                       value={value.chatPersona ?? preset?.prompt ?? ''}
-                      onChange={(e) => onChange({
-                        ...value,
-                        chatPreset: value.chatPreset || 'custom',
-                        chatPersona: e.target.value
-                      })}
+                      onChange={(e) => {
+                        const val = e.target.value
+                        onChange({
+                          ...value,
+                          chatPreset: value.chatPreset || 'custom',
+                          chatPersona: preset && val.trim() === preset.prompt.trim() ? undefined : val
+                        })
+                      }}
                       placeholder="在这里查看、微调角色词条，或编写自己的纯聊天人设…"
                     />
                     {preset && (value.chatPersona ?? '').trim() !== preset.prompt.trim() && (

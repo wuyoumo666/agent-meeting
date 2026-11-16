@@ -169,6 +169,9 @@ export interface ModeratorConfig {
   model: string
   models?: string[]
   reasoningEffort?: ReasoningEffort
+  /** 可选快速副模型（用于命令审查、例行跟进与记忆压缩；留空则全用主模型） */
+  fastProviderId?: string
+  fastModel?: string
 }
 
 export type ModeratorSettings = Omit<ModeratorConfig, 'apiKey'> & { hasApiKey: boolean }

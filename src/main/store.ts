@@ -219,6 +219,11 @@ export class Store {
       changed = true
     }
     for (const a of this.db.agents) {
+      if (a.chatPreset && a.chatPersona && /^角色：[\s\S]*外观：/.test(a.chatPersona)) {
+        // 旧版纯聊天预设自带了外貌与场景正文，清除缓存让成员自动使用精简纯性格版
+        a.chatPersona = undefined
+        changed = true
+      }
       if (a.kind !== 'cli' || a.autoName === false || !a.cli) continue
       // 旧版 agy 预设（json 无流式）升级到 stream-json
       if (a.cli.session === 'agy' && a.cli.outputMode === 'json') {
@@ -314,6 +319,8 @@ export class Store {
         enabled: moderator.enabled, providerId: moderator.providerId, reviewCommands: moderator.reviewCommands,
         baseUrl: (moderator.providerId ? this.db.providers.find((p) => p.id === moderator.providerId)?.baseUrl : moderator.baseUrl) ?? '',
         model: moderator.model, models: moderator.models, reasoningEffort: moderator.reasoningEffort,
+        fastProviderId: moderator.fastProviderId,
+        fastModel: moderator.fastModel,
         hasApiKey: Boolean(moderator.providerId
           ? this.db.providers.some((p) => p.id === moderator.providerId && (p.apiKey || p.credentialRef))
           : moderator.apiKey || moderator.credentialRef)
@@ -330,24 +337,54 @@ export class Store {
       enabled: cfg.enabled, providerId: cfg.providerId, reviewCommands: cfg.reviewCommands,
       baseUrl: cfg.providerId ? provider?.baseUrl ?? '' : cfg.baseUrl,
       model: cfg.model, models: cfg.models, reasoningEffort: cfg.reasoningEffort,
+      fastProviderId: cfg.fastProviderId,
+      fastModel: cfg.fastModel,
       apiKey: cfg.providerId ? provider?.apiKey ?? '' : this.credentialKey(cfg)
     }
   }
-  setModerator({ apiKey, enabled, baseUrl, model, models, reviewCommands, providerId, reasoningEffort }: ModeratorUpdate): Promise<void> {
+  getModeratorFast(): { provider: Provider; model: string } | undefined {
+    const mod = this.getModerator()
+    const fastModel = mod.fastModel?.trim()
+    if (!mod.enabled || !fastModel) return undefined
+    if (mod.fastProviderId) {
+      const p = this.getProvider(mod.fastProviderId)
+      if (!p || !p.baseUrl.trim()) return undefined
+      return { provider: p, model: fastModel }
+    }
+    if (!mod.baseUrl.trim()) return undefined
+    return {
+      provider: { id: 'moderator-fast', name: '快速主持人', baseUrl: mod.baseUrl, apiKey: mod.apiKey, models: [] },
+      model: fastModel
+    }
+  }
+  setModerator({ apiKey, enabled, baseUrl, model, models, reviewCommands, providerId, reasoningEffort, fastProviderId, fastModel }: ModeratorUpdate): Promise<void> {
     return this.updateCredential(async () => {
       const previous = this.db.moderator
+      const cleanFastProviderId = fastProviderId?.trim() || undefined
+      const cleanFastModel = fastModel?.trim() || undefined
+      if (cleanFastProviderId && !this.getProvider(cleanFastProviderId)) {
+        throw new Error('所选快速副模型的服务已不存在，请重新选择。')
+      }
       if (providerId) {
         const provider = this.getProvider(providerId)
         if (!provider) throw new Error('所选模型服务已不存在，请重新选择。')
         await this.replaceCredential('', previous ?? {}, () => {
-          this.db.moderator = { enabled, providerId, baseUrl: provider.baseUrl, model, models, reasoningEffort, reviewCommands: reviewCommands ?? previous?.reviewCommands }
+          this.db.moderator = {
+            enabled, providerId, baseUrl: provider.baseUrl, model, models, reasoningEffort,
+            fastProviderId: cleanFastProviderId, fastModel: cleanFastModel,
+            reviewCommands: reviewCommands ?? previous?.reviewCommands
+          }
           return () => { this.db.moderator = previous }
         })
         return
       }
       this.checkKeyEndpoint(previous, baseUrl, apiKey)
       await this.replaceCredential(apiKey, previous ?? {}, (credential) => {
-        this.db.moderator = { enabled, baseUrl, model, models, reasoningEffort, reviewCommands: reviewCommands ?? previous?.reviewCommands, ...credential }
+        this.db.moderator = {
+          enabled, baseUrl, model, models, reasoningEffort,
+          fastProviderId: cleanFastProviderId, fastModel: cleanFastModel,
+          reviewCommands: reviewCommands ?? previous?.reviewCommands, ...credential
+        }
         return () => { this.db.moderator = previous }
       })
     })

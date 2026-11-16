@@ -45,7 +45,7 @@ const TOOLS: ToolDef[] = [
   tool('list_files', '只读列出本会话成员工作目录的文件，默认共享工作目录。', { path: S }, []),
   tool('inspect_file', '实际读取成果文件并记录校验值。交付前必须调用，检查文字是否完整、满足要求。长文/图片/表格/版式应另派成员使用对应工具审阅。', { path: S }, ['path']),
   ...VISUAL_TOOLS.map((item) => tool(item.name, item.description, { path: S, ...(item.name === 'view_pdf' ? { page: { type: 'integer', minimum: 1 } } : {}) }, ['path'])),
-  tool('ask_user', '关键需求仍有多种理解，或缺少会影响交付的条件时，先问用户一个聚焦的问题，可给简短选项。记录等待状态，用户答复后沿用同一项目。', { question: S }, ['question']),
+  tool('ask_user', '仅当确实缺少无法推定的关键前提或涉及重大不可逆取舍时使用，绝大多数常规细节直接按合理默认值推进不打断用户。记录等待状态，用户答复后沿用同一项目。', { question: S }, ['question']),
   tool('close_task', '已失败任务由其他成员接替并解决后，记录原因并关闭旧任务。不能关闭正在运行的任务。', { task_id: S, reason: S }, ['task_id', 'reason']),
   tool('deliver_files', '用 inspect_file 检查后交付文件。summary 用两三句话写明完成内容、核对过什么、还有什么未完成。有未解决任务时可用 remaining 明确交付阶段成果。软件保存实际副本和工具来源。', { paths: { type: 'array', items: S, minItems: 1, maxItems: 8 }, summary: S, remaining: S }, ['paths', 'summary'])
 ]
@@ -239,9 +239,26 @@ export class Manager {
     const history = messages.filter((m) => m.kind === 'chat' && !m.internal).slice(-20)
     const recentDeliveries = messages.filter((m) => m.deliveries?.length).slice(-3)
       .flatMap((m) => m.deliveries ?? []).map(({ name, path }) => ({ name, path }))
+    const recentTasksStart = Math.max(0, p.tasks.length - 3)
+    const compactTasks = p.tasks.map((task, idx) => {
+      const keepFull = active(task) || task.status === 'error' || task.status === 'interrupted' || idx >= recentTasksStart
+      return {
+        ...task,
+        task: task.task.slice(0, keepFull ? 1400 : 280),
+        result: task.result?.slice(0, keepFull ? 3000 : 500)
+      }
+    })
+    const fullAttStart = Math.max(0, history.length - 4)
+    const formattedHistory = history.map((m, idx) => {
+      const attText = m.attachments?.map((a) =>
+        `\n附件 ${a.name} (${a.path}): ${idx >= fullAttStart ? (a.text?.slice(0, 6000) ?? '未提取到文字，需成员实际读取') : '前文已提供，按需再读'}`
+      ).join('') ?? ''
+      return `[${m.senderId === 'user' ? '用户' : m.senderName}] ${m.text.slice(0, 2000)}${attText}`
+    }).join('\n').slice(-18000)
     const input: AgentMsg[] = [{ role: 'system', content: [
       managerPolicy,
-      `当前群聊：${room.name}。常规答复两三句，用户要求完整内容时按要求展开。用户点名成员时优先采纳。`,
+      `当前群聊：${room.name}。常规答复两三句，用户要求完整内容时按要求展开。用户点名成员时优先采纳。能由同一位成员连续做完的步骤直接合为一单 ` +
+      `assign_task 一次执行（禁止拆成「先勘察→再制作→最后再单派一次复制」多段冷启动）；成员回报已有清晰路径与自测结果时，只用 inspect_file 核对最终交付文件后直接 deliver_files 收尾。`,
       `可用成员：${JSON.stringify(members.map((a) => ({
         id: a.id,
         name: a.name,
@@ -250,16 +267,20 @@ export class Manager {
         busy: p.tasks.some((other) => active(other) && other.agentId === a.id),
         canGiveOpinion: a.kind === 'api',
         access: a.access ?? 'workspace',
-        persona: a.persona?.slice(0, 600)
+        persona: a.persona?.slice(0, 400)
       })))}。选人时对照任务类型、成员 runtime/kind/persona/capabilities 与 busy 状态择优指派；用户点名成员时优先采纳。请本地成员参与时用 assign_task 指明只评估或需要实际执行什么。`,
       this.host.capabilities ? `当前能力记录：${await this.host.capabilities(p.roomId, undefined, signal)}` : '',
       `获准的工作目录：${JSON.stringify(roots)}。相对路径默认第一个目录。交付副本由软件保存，保留源文件。`
-    ].join('\n') }, { role: 'user', content: `触发原因：${reason}\n项目需求：${p.request}\n本会话近期交付副本：${JSON.stringify(recentDeliveries)}\n实际分工和回报：${JSON.stringify(p.tasks.map((task) => ({ ...task, task: task.task.slice(0, 1600), result: task.result?.slice(0, 3500) })))}\n本会话最近消息：\n${history.map((m) => `[${m.senderId === 'user' ? '用户' : m.senderName}] ${m.text.slice(0, 2200)}${m.attachments?.map((a) => `\n附件 ${a.name} (${a.path}): ${a.text?.slice(0, 7000) ?? '未提取到文字，需成员实际读取'}`).join('') ?? ''}`).join('\n').slice(-26000)}` }]
-    const provider = { ...cfg, id: 'manager', name: '经理', models: [cfg.model] }
+    ].join('\n') }, { role: 'user', content: `触发原因：${reason}\n项目需求：${p.request}\n本会话近期交付副本：${JSON.stringify(recentDeliveries)}\n实际分工和回报：${JSON.stringify(compactTasks)}\n本会话最近消息：\n${formattedHistory}` }]
+    const fast = this.store.getModeratorFast()
+    const useFast = Boolean(fast && reason.includes('有成员任务返回') && p.tasks.some(active))
+    const provider = useFast ? fast!.provider : { ...cfg, id: 'manager', name: '经理', models: [cfg.model] }
+    const activeModel = useFast ? fast!.model : cfg.model
+    const activeEffort = useFast ? undefined : cfg.reasoningEffort
     const checked = new Map<string, DeliveryFile>()
     const listed = new Set<string>()
     const observeTool = this.host.observeTool?.(p.roomId)
-    const onModelRate = modelRateObserver(this.host.emit, p.roomId, '经理')
+    const onModelRate = modelRateObserver(this.host.emit, p.roomId, useFast ? '经理(快速)' : '经理')
     let delivered = false
     let deliveryError = ''
     let visualAvailable = true
@@ -267,9 +288,9 @@ export class Manager {
       signal.throwIfAborted()
       let result
       try {
-        result = await chatOnce(provider, cfg.model, input,
+        result = await chatOnce(provider, activeModel, input,
           step < 12 ? TOOLS.filter((item) => visualAvailable || !VISUAL_TOOLS.some((visual) => visual.name === item.function.name)) : undefined,
-          signal, (detail) => { p.note = detail; this.save(p) }, cfg.reasoningEffort, { retryTimeout: true, onModelRate })
+          signal, (detail) => { p.note = detail; this.save(p) }, activeEffort, { retryTimeout: true, onModelRate })
       } catch (error) {
         if (!visualAvailable || !imageInputError(error) || !input.some((message) => Array.isArray(message.content) && message.content.some((part) => part.type === 'image_url'))) throw error
         visualAvailable = false
