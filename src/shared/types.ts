@@ -39,6 +39,10 @@ export interface Agent {
   color: string
   kind: 'api' | 'cli' | 'demo'
   persona: string
+  /** 纯聊天区内置人设预设 ID（如 claude / gpt / deepseek / custom） */
+  chatPreset?: string
+  /** 纯聊天区专属人设正文 */
+  chatPersona?: string
   providerId?: string
   model?: string
   reasoningEffort?: ReasoningEffort
@@ -56,8 +60,16 @@ export interface Room {
   createdAt: number
   /** Hidden from active conversations; messages, attachments and sessions are retained. */
   archivedAt?: number
-  /** 群聊（默认）或私聊（一个 bot 一个会话） */
-  kind?: 'group' | 'dm'
+  /** 办公群聊（默认）、办公私聊（dm）、纯聊天单聊（chat-dm）、纯聊天群聊（chat-group） */
+  kind?: 'group' | 'dm' | 'chat-dm' | 'chat-group'
+}
+
+export function isPureChatRoom(room?: Pick<Room, 'kind'> | null): boolean {
+  return room?.kind === 'chat-dm' || room?.kind === 'chat-group'
+}
+
+export function isDmKind(room?: Pick<Room, 'kind'> | null): boolean {
+  return room?.kind === 'dm' || room?.kind === 'chat-dm'
 }
 
 export interface Attachment {

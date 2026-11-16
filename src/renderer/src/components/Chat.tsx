@@ -1,10 +1,12 @@
 import { lazy, memo, Suspense, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import type { ActivityEntry, Agent, AgentWorkInfo, Attachment, ManagerProject, Message, ModelRate, Room, WorkTarget, WorkspaceState } from '../../../shared/types'
+import { isDmKind, isPureChatRoom, type ActivityEntry, type Agent, type AgentWorkInfo, type Attachment, type ManagerProject, type Message, type ModelRate, type Room, type WorkTarget, type WorkspaceState } from '../../../shared/types'
 import { findMentions } from '../../../shared/mentions'
+import { findPersonaPreset, personaDisplayLabel } from '../../../shared/personas'
 import type { AgentStatus } from '../App'
 import Members from './Members'
+import PersonaPicker from './PersonaPicker'
 import { AccessSelect } from './WorkAccess'
 import { agentColors } from '../identity'
 import { DeliveryCards, ManagerPanel, SourceLinks } from './ManagerPanel'
@@ -56,6 +58,7 @@ interface Props {
   onRestore: () => Promise<void>
   onDelete: () => void
   onToggleMember: (id: string) => void
+  onSaveAgent: (agent: Agent) => Promise<void>
   onSetAccess: (id: string, access: Agent['access']) => void
 }
 
@@ -311,8 +314,9 @@ function RunCard({ ws, approvalsOnly, onStop, onStopRun, onApprove }: {
 export default function Chat(props: Props): React.JSX.Element {
   const { room, participants, messages, pending, statuses, workspace, agentWork, activity } = props
   const colors = useMemo(() => agentColors(props.allAgents), [props.allAgents])
-  const isDm = room.kind === 'dm'
-  const managerMode = !isDm && props.managerReady
+  const isPureChat = isPureChatRoom(room)
+  const isDm = isDmKind(room)
+  const managerMode = !isDm && !isPureChat && props.managerReady
   const managerRunning = managerMode && ['planning', 'working', 'reviewing'].includes(props.managerProject?.status ?? '')
   const visibleMessages = useMemo(() => managerMode
     ? messages.filter((m) => !m.internal && (m.senderId === 'user' || m.senderId === 'moderator'))
@@ -328,6 +332,7 @@ export default function Chat(props: Props): React.JSX.Element {
   const [dragging, setDragging] = useState(false)
   const [mentionQuery, setMentionQuery] = useState<string | null>(null)
   const [membersOpen, setMembersOpen] = useState(false)
+  const [personaOpen, setPersonaOpen] = useState(false)
   const [helpOpen, setHelpOpen] = useState(false)
   const [moreOpen, setMoreOpen] = useState(false)
   const [activityOpen, setActivityOpen] = useState(false)
@@ -624,24 +629,35 @@ export default function Chat(props: Props): React.JSX.Element {
             <span className="rail-icon"><Icon name="panel" />{props.hasUnread && <i className="rail-unread" />}</span>
           </button>
           <h1 title={room.name}>{room.name}</h1>
+          {isPureChat && <span className="pure-chat-badge">纯聊天</span>}
           <div className="chat-actions">
-            <button className="ghost-btn pane-deliveries header-deliveries" aria-label="交付记录" title="查看文件与来源" onClick={() => setDeliveriesOpen(true)}><Icon name="files" /><span className="wide-label">交付记录</span><span className="short-label" aria-hidden="true">交付</span></button>
-            {isDm && participants[0] && participants[0].kind !== 'demo' && (
+            {isPureChat && participants.length > 0 && (
+              <button
+                className={personaOpen ? 'ghost-btn persona-btn active' : 'ghost-btn persona-btn'}
+                aria-expanded={personaOpen}
+                title="选择或切换《AI情公寓》角色人设"
+                onClick={() => { setMembersOpen(false); setMoreOpen(false); setPersonaOpen((v) => !v) }}
+              >
+                🎭 {isDm ? (personaDisplayLabel(participants[0]) || '选人设') : '角色设定'}
+              </button>
+            )}
+            {!isPureChat && <button className="ghost-btn pane-deliveries header-deliveries" aria-label="交付记录" title="查看文件与来源" onClick={() => setDeliveriesOpen(true)}><Icon name="files" /><span className="wide-label">交付记录</span><span className="short-label" aria-hidden="true">交付</span></button>}
+            {!isPureChat && isDm && participants[0] && participants[0].kind !== 'demo' && (
               <div className="access-quick">
                 <span className="dim small" aria-hidden="true">工作权限</span>
                 <AccessSelect agent={participants[0]} onChange={(access) => props.onSetAccess(participants[0].id, access)} />
               </div>
             )}
-            {!isDm && <button className="ghost-btn members-button" aria-label={`成员 ${participants.length}`} aria-expanded={membersOpen} title="管理参会者和工作权限" onClick={() => { setMoreOpen(false); setMembersOpen((v) => !v) }}><Icon name="users" /><span className="button-label">成员</span><span className="member-count">{participants.length}</span></button>}
+            {!isDm && <button className="ghost-btn members-button" aria-label={`成员 ${participants.length}`} aria-expanded={membersOpen} title={isPureChat ? '管理聊天群成员' : '管理参会者和工作权限'} onClick={() => { setMoreOpen(false); setPersonaOpen(false); setMembersOpen((v) => !v) }}><Icon name="users" /><span className="button-label">成员</span><span className="member-count">{participants.length}</span></button>}
             <div className="more-wrap" onKeyDown={(e) => { if (e.key === 'Escape') setMoreOpen(false) }}>
-              <button className="icon-btn more-btn" title="更多操作" aria-label="更多操作" aria-expanded={moreOpen} onClick={() => { setMembersOpen(false); setMoreOpen((v) => !v) }}><Icon name="more" /></button>
+              <button className="icon-btn more-btn" title="更多操作" aria-label="更多操作" aria-expanded={moreOpen} onClick={() => { setMembersOpen(false); setPersonaOpen(false); setMoreOpen((v) => !v) }}><Icon name="more" /></button>
               {moreOpen && (
                 <div className="more-menu" aria-label="更多操作">
-                  {!isDm && !managerMode && <button onClick={() => { setMoreOpen(false); props.onManagerSettings() }}>配置主持人</button>}
+                  {!isPureChat && !isDm && !managerMode && <button onClick={() => { setMoreOpen(false); props.onManagerSettings() }}>配置主持人</button>}
                   <button onClick={() => { setMoreOpen(false); setHistoryOpen(true) }}>搜索记录</button>
                   {!!activity?.length && <button onClick={() => { setMoreOpen(false); setActivityOpen(true) }}>活动记录</button>}
                   <button disabled={exporting} onClick={() => { setMoreOpen(false); void exportHistory() }}>导出 Markdown</button>
-                  {!isDm && <button onClick={() => { setMoreOpen(false); props.onEditRoom() }}>群聊设置</button>}
+                  {!isDm && <button onClick={() => { setMoreOpen(false); props.onEditRoom() }}>{isPureChat ? '聊天群设置' : '群聊设置'}</button>}
                   <button disabled={archiveBusy} title={room.archivedAt ? '恢复到会话列表' : '收起会话并保留记录，正在执行的任务会继续'} onClick={() => void changeArchive()}>{room.archivedAt ? '恢复会话' : '归档会话'}</button>
                   <button onClick={() => { setMoreOpen(false); setHelpOpen(true) }}>使用帮助</button>
                   <button className="delete-conversation" disabled={archiveBusy} onClick={() => { setMoreOpen(false); props.onDelete() }}>删除会话</button>
@@ -653,18 +669,29 @@ export default function Chat(props: Props): React.JSX.Element {
         {!isDm && !managerMode && (
           <div className="chat-navigation">
             <div className="chips" aria-label="当前参会者">
+            {isPureChat && participants.length > 1 && (
+              <button
+                className="chip chip-all"
+                title="在群里招呼大家一起回话（@全体）"
+                onClick={() => insertMention('全体')}
+              >
+                📢 全体
+              </button>
+            )}
             {participants.map((a) => {
               const st = statuses[a.id]?.state ?? 'idle'
+              const badge = isPureChat ? personaDisplayLabel(a) : ''
               return (
                 <button
                   key={a.id}
                   className={`chip st-${st}`}
-                  title={managerMode ? a.name : `@${a.name}${statuses[a.id]?.detail ? ' · ' + statuses[a.id].detail : ''}`}
+                  title={managerMode ? a.name : `@${a.name}${badge ? '（' + badge + '）' : ''}${statuses[a.id]?.detail ? ' · ' + statuses[a.id].detail : ''}`}
                   disabled={managerMode}
                   onClick={() => insertMention(a.name)}
                 >
                   <i style={{ background: colors.get(a.id) || a.color }} />
                   {a.name}
+                  {badge && <span className="chip-persona">{badge}</span>}
                 </button>
               )
             })}
@@ -683,9 +710,19 @@ export default function Chat(props: Props): React.JSX.Element {
         <Members
           agents={props.allAgents}
           participantIds={room.participantIds}
+          pureChat={isPureChat}
           onToggle={props.onToggleMember}
           onAccess={props.onSetAccess}
           onClose={() => setMembersOpen(false)}
+        />
+      )}
+
+      {isPureChat && personaOpen && (
+        <PersonaPicker
+          agents={participants}
+          initialAgentId={participants[0]?.id}
+          onSaveAgent={props.onSaveAgent}
+          onClose={() => setPersonaOpen(false)}
         />
       )}
 
@@ -702,7 +739,7 @@ export default function Chat(props: Props): React.JSX.Element {
         onStop={runningNow ? (workRunning && !managerMode && !anyRunning ? props.onStopWorkspace : props.onStop) : undefined}
       />}
 
-      {isDm && agentWork && (agentWork.active?.roomId !== room.id || agentWork.queued > 0) && (
+      {isDm && !isPureChat && agentWork && (agentWork.active?.roomId !== room.id || agentWork.queued > 0) && (
         <div className="agent-work-banner" title="这个 bot 在别的聊天里还有工作；点「查看」跳过去">
           {agentWork.active && agentWork.active.roomId !== room.id && (
             <span title={agentWork.active.task}>正在「{agentWork.active.roomName}」执行任务</span>
@@ -715,8 +752,8 @@ export default function Chat(props: Props): React.JSX.Element {
       )}
       <div className={managerMode ? 'chat-panes' : 'chat-panes single'}>
       <section className="user-pane" aria-label={managerMode ? '我和经理' : '聊天'}>
-      {!managerMode && props.managerProject && !isDm && <ManagerPanel project={props.managerProject} ready={props.managerReady} onSettings={props.onManagerSettings} onStop={props.onStop} />}
-      {!managerMode && <RunCard ws={workspace} onStop={props.onStopWorkspace} onStopRun={props.onStopRun} onApprove={props.onApproveCommand} />}
+      {!managerMode && !isPureChat && props.managerProject && !isDm && <ManagerPanel project={props.managerProject} ready={props.managerReady} onSettings={props.onManagerSettings} onStop={props.onStop} />}
+      {!managerMode && !isPureChat && <RunCard ws={workspace} onStop={props.onStopWorkspace} onStopRun={props.onStopRun} onApprove={props.onApproveCommand} />}
       <div
         className="messages"
         ref={scrollRef}
@@ -732,11 +769,36 @@ export default function Chat(props: Props): React.JSX.Element {
         ) : props.loading ? (
           <div className="chat-empty" role="status">加载消息…</div>
         ) : visibleMessages.length === 0 && !props.hasEarlier ? (
-          <div className="chat-empty room-welcome">
-            <span className="welcome-mark brand-mark" aria-hidden="true" />
-            <p className="empty-title">{managerMode ? '和经理说说你要做什么' : '开始讨论'}</p>
-            <p>{managerMode ? '直接提问或交代任务，经理会按需找成员讨论或执行。' : isDm ? `给 ${room.name} 发消息，它会单独回复你；需要它动手就点「派活」。` : participants.length ? '直接提问，或输入 @ 指定一位成员。' : '在「成员」里添加参会者，然后发个问题。'}</p>
-          </div>
+          isPureChat ? (() => {
+            const first = participants[0]
+            const preset = first ? findPersonaPreset(first.chatPreset) : undefined
+            return (
+              <div className="chat-empty room-welcome">
+                <span className="welcome-mark brand-mark" aria-hidden="true" />
+                <p className="empty-title">{isDm ? `和 ${room.name} 聊聊天` : `欢迎来到 ${room.name}`}</p>
+                <p>
+                  {isDm
+                    ? (preset
+                      ? `当前角色：《AI情公寓》${preset.name}（${preset.aliases}）—— ${preset.tagline}`
+                      : `这里是独立纯聊天区，不触发经理和工作区派活，轻松把 ${room.name} 当聊天 AI 玩。`)
+                    : (participants.length
+                      ? '纯聊天群已就绪：成员之间不会触发经理派活，可以点上方 @成员 或 📢 全体 一起开聊！'
+                      : '在「成员」里拉入 AI 成员，即可开始群聊或《AI情公寓》同台互动。')}
+                </p>
+                {participants.length > 0 && (
+                  <button className="ghost-btn" style={{ marginTop: 6 }} onClick={() => setPersonaOpen(true)}>
+                    🎭 {isDm ? (preset ? '切换《AI情公寓》角色人设' : '给它选个《AI情公寓》人设') : '配置成员角色人设'}
+                  </button>
+                )}
+              </div>
+            )
+          })() : (
+            <div className="chat-empty room-welcome">
+              <span className="welcome-mark brand-mark" aria-hidden="true" />
+              <p className="empty-title">{managerMode ? '和经理说说你要做什么' : '开始讨论'}</p>
+              <p>{managerMode ? '直接提问或交代任务，经理会按需找成员讨论或执行。' : isDm ? `给 ${room.name} 发消息，它会单独回复你；需要它动手就点「派活」。` : participants.length ? '直接提问，或输入 @ 指定一位成员。' : '在「成员」里添加参会者，然后发个问题。'}</p>
+            </div>
+          )
         ) : <>
           {props.hasEarlier && <div className="history-earlier">
             <button className="ghost-btn" disabled={olderLoading} onClick={() => void loadEarlier()}>{olderLoading ? '加载中…' : '加载更早的消息'}</button>
@@ -789,7 +851,7 @@ export default function Chat(props: Props): React.JSX.Element {
         )}
         {composerError && <p className="composer-error" role="alert">{composerError}</p>}
         <div className="composer">
-          {!managerMode && sendToWorkspace && <div className="dispatch-preview">
+          {!managerMode && !isPureChat && sendToWorkspace && <div className="dispatch-preview">
             {taskAgent ? <>
               <span><b>执行者</b> {taskAgent.name}</span>
               <span><b>目录</b> {preview?.directory || (preview?.error ? '未就绪' : '正在确认…')}</span>
@@ -801,9 +863,12 @@ export default function Chat(props: Props): React.JSX.Element {
             value={draft}
             aria-label="消息"
             title="Enter 发送，Shift+Enter 换行"
-            placeholder={managerMode ? '告诉经理你想要什么成果…' : isDm
-              ? sendToWorkspace ? `给 ${room.name} 派活：写清要它做的事…` : `给 ${room.name} 发消息…`
-              : sendToWorkspace ? '输入 @ 点名一位参会者，再写任务…' : '写消息，输入 @ 点名…'}
+            placeholder={managerMode ? '告诉经理你想要什么成果…'
+              : isPureChat
+                ? (isDm ? `和 ${room.name} 随便聊聊…` : '发消息闲聊，输入 @ 点名或 @全体 招呼大家…')
+                : isDm
+                  ? sendToWorkspace ? `给 ${room.name} 派活：写清要它做的事…` : `给 ${room.name} 发消息…`
+                  : sendToWorkspace ? '输入 @ 点名一位参会者，再写任务…' : '写消息，输入 @ 点名…'}
             readOnly={sending}
             onChange={(e) => {
               setDraft(e.target.value)
@@ -822,7 +887,7 @@ export default function Chat(props: Props): React.JSX.Element {
           />
           <div className="composer-actions">
             <button className="ghost-btn att-btn" onClick={() => void addFiles()} disabled={sending}><Icon name="attach" />附件</button>
-            {!managerMode && <button
+            {!managerMode && !isPureChat && <button
               className="ghost-btn work-toggle"
               aria-pressed={sendToWorkspace}
               title="把这条消息作为任务派给参会者"
@@ -833,7 +898,7 @@ export default function Chat(props: Props): React.JSX.Element {
               }}
             ><Icon name="task" />派活</button>}
             <button className="primary-btn" onClick={() => void send()} disabled={sending || (!draft.trim() && attachments.length === 0)}>
-              {managerMode ? '发给经理' : sendToWorkspace ? '派发' : '发送'}
+              {managerMode ? '发给经理' : (!isPureChat && sendToWorkspace) ? '派发' : '发送'}
               <Icon name="send" />
             </button>
           </div>

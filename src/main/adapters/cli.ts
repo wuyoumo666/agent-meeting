@@ -29,6 +29,10 @@ export interface CliRunOpts {
   agySettings?: string
   /** 追加一段“会自己动手”的系统提示（CodeBuddy） */
   agentic?: boolean
+  /** 纯聊天模式：不启用工作区工具与办公提示 */
+  pureChat?: boolean
+  /** 可选系统提示（claude/codebuddy 通过 --append-system-prompt 传入） */
+  systemPrompt?: string
   /** 实时活动日志（工具调用/文本） */
   onLog?: (kind: 'text' | 'tool' | 'info', text: string) => void
   onModelRate?: (rate: ModelRate) => void
@@ -228,11 +232,20 @@ function runCliInner(
   return new Promise((resolve, reject) => {
     signal.throwIfAborted()
     let args = cfg.args
-    if (opts?.work || opts?.autonomous) args = workArgs(args, cfg.session, opts.readOnlyTask ? 'readonly' : agent.access)
-    args = [...args]
-    if (opts?.mcpConfig && cfg.session === 'claude') args.push('--strict-mcp-config', '--mcp-config', opts.mcpConfig)
-    if (opts?.agySettings && cfg.session === 'agy') args.push('--settings', opts.agySettings)
-    if (opts?.agentic && cfg.session === 'claude') args.push('--append-system-prompt', AGENTIC_PROMPT)
+    if (opts?.pureChat) {
+      args = [...args]
+      if (cfg.session === 'claude') {
+        const toolsIdx = args.indexOf('--tools')
+        if (toolsIdx >= 0 && toolsIdx + 1 < args.length) args[toolsIdx + 1] = ''
+      }
+    } else {
+      if (opts?.work || opts?.autonomous) args = workArgs(args, cfg.session, opts.readOnlyTask ? 'readonly' : agent.access)
+      args = [...args]
+      if (opts?.mcpConfig && cfg.session === 'claude') args.push('--strict-mcp-config', '--mcp-config', opts.mcpConfig)
+      if (opts?.agySettings && cfg.session === 'agy') args.push('--settings', opts.agySettings)
+      if (opts?.agentic && cfg.session === 'claude') args.push('--append-system-prompt', AGENTIC_PROMPT)
+    }
+    if (opts?.systemPrompt && cfg.session === 'claude') args.push('--append-system-prompt', opts.systemPrompt)
     let newSessionId: string | undefined
     if (cfg.session === 'claude') {
       if (prevSessionId) {

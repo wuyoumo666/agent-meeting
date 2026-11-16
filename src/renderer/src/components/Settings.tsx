@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { Agent, AppState, CliConfig, MemoryRecord, ModeratorSettings, ModeratorUpdate, ProviderSettings, ProviderUpdate, ReasoningEffort, Room, RulesFile, ScheduledTask } from '../../../shared/types'
-import { AGENT_COLORS, CLI_PRESETS, DEFAULT_RULES, GLOBAL_MEMORY_KEY, PRESET_MODELS, REASONING_LEVELS } from '../../../shared/types'
+import { AGENT_COLORS, CLI_PRESETS, DEFAULT_RULES, GLOBAL_MEMORY_KEY, isPureChatRoom, PRESET_MODELS, REASONING_LEVELS } from '../../../shared/types'
+import { findPersonaPreset, PERSONA_PRESETS, personaDisplayLabel } from '../../../shared/personas'
 import type { Confirmation } from './ConfirmDialog'
 import WorkAccess, { accessLabel } from './WorkAccess'
 
@@ -172,26 +173,30 @@ export default function Settings({ state, initialTab = 'providers', onClose, onC
             {tab === 'agents' && (
               <div className="settings-list">
                 {!state.agents.length && <p className="settings-empty">添加参会者后，即可在群聊中邀请它加入讨论。</p>}
-                {state.agents.map((a) => (
-                  <div key={a.id} className="list-row">
-                    <div className="row-left">
-                      <div className="avatar sm" style={{ '--identity': a.color } as React.CSSProperties} aria-hidden="true">{a.name.slice(0, 1)}</div>
-                      <div>
-                        <b>{a.name}</b>
-                        <div className="dim small">
-                          {agentTypes[a.kind]}{a.kind === 'api' ? ` · ${a.model || '未选模型'}` : a.kind === 'cli' && a.cli?.command ? ` · ${a.cli.command}` : ''}
+                {state.agents.map((a) => {
+                  const chatBadge = personaDisplayLabel(a)
+                  return (
+                    <div key={a.id} className="list-row">
+                      <div className="row-left">
+                        <div className="avatar sm" style={{ '--identity': a.color } as React.CSSProperties} aria-hidden="true">{a.name.slice(0, 1)}</div>
+                        <div>
+                          <b>{a.name}</b>
+                          <div className="dim small">
+                            {agentTypes[a.kind]}{a.kind === 'api' ? ` · ${a.model || '未选模型'}` : a.kind === 'cli' && a.cli?.command ? ` · ${a.cli.command}` : ''}
+                            {chatBadge ? ` · 纯聊人设：${chatBadge}` : ''}
+                          </div>
                         </div>
                       </div>
+                      <div>
+                        {a.kind !== 'demo' && <span className="settings-permission-label">{accessLabel(a)}</span>}
+                        <button className="ghost-btn" onClick={() => setEditA({ ...a, cli: a.cli ? { ...a.cli, args: [...a.cli.args] } : undefined })}>编辑</button>
+                        <button className="danger-btn" onClick={() => onConfirm({
+                          message: `删除参会者「${a.name}」？`, label: '删除参会者', action: () => window.api.deleteAgent(a.id)
+                        })}>删除</button>
+                      </div>
                     </div>
-                    <div>
-                      {a.kind !== 'demo' && <span className="settings-permission-label">{accessLabel(a)}</span>}
-                      <button className="ghost-btn" onClick={() => setEditA({ ...a, cli: a.cli ? { ...a.cli, args: [...a.cli.args] } : undefined })}>编辑</button>
-                      <button className="danger-btn" onClick={() => onConfirm({
-                        message: `删除参会者「${a.name}」？`, label: '删除参会者', action: () => window.api.deleteAgent(a.id)
-                      })}>删除</button>
-                    </div>
-                  </div>
-                ))}
+                  )
+                })}
               </div>
             )}
           </div>}
@@ -321,8 +326,16 @@ function ProviderForm({ value, notice, onChange, onSave, onCancel }: {
   )
 }
 
+function roomKindTitle(r?: Room): string {
+  if (!r) return '已删除的会议室'
+  if (r.kind === 'dm') return `办公私聊 · ${r.name}`
+  if (r.kind === 'chat-dm') return `纯聊私聊 · ${r.name}`
+  if (r.kind === 'chat-group') return `纯聊群 · ${r.name}`
+  return r.name
+}
+
 function SchedulePanel({ rooms, agents, tasks }: { rooms: Room[]; agents: Agent[]; tasks: ScheduledTask[] }): React.JSX.Element {
-  const firstRoom = rooms.find((r) => r.kind !== 'dm' && r.participantIds.length > 0) ?? rooms.find((r) => r.participantIds.length > 0)
+  const firstRoom = rooms.find((r) => !isPureChatRoom(r) && r.kind !== 'dm' && r.participantIds.length > 0) ?? rooms.find((r) => r.participantIds.length > 0)
   const [roomId, setRoomId] = useState(firstRoom?.id ?? '')
   const room = rooms.find((r) => r.id === roomId)
   const participants = useMemo(
@@ -375,7 +388,7 @@ function SchedulePanel({ rooms, agents, tasks }: { rooms: Room[]; agents: Agent[
         <div className="schedule-form settings-field-grid">
           <label>会议室
             <select value={roomId} onChange={(e) => changeRoom(e.target.value)}>
-              {rooms.map((r) => <option key={r.id} value={r.id}>{r.kind === 'dm' ? `私聊 · ${r.name}` : r.name}</option>)}
+              {rooms.map((r) => <option key={r.id} value={r.id}>{roomKindTitle(r)}</option>)}
             </select>
           </label>
           <label>执行者
@@ -403,7 +416,7 @@ function SchedulePanel({ rooms, agents, tasks }: { rooms: Room[]; agents: Agent[
         return (
           <div key={t.id} className="mem-room">
             <div className="mem-room-head">
-              <b>{r?.kind === 'dm' ? `私聊 · ${r.name}` : (r?.name ?? '已删除的会议室')} · {a?.name ?? '已删除的 bot'}</b>
+              <b>{roomKindTitle(r)} · {a?.name ?? '已删除的 bot'}</b>
               <span className="dim small">每 {t.everyMinutes} 分钟</span>
               <button
                 className="ghost-btn"
@@ -824,9 +837,73 @@ function AgentForm({ value, providers, moderator, onChange, onSave, onCancel }: 
           </details>
         )}
 
-        <label className="settings-block">人设（可选）
+        <label className="settings-block">办公人设（可选，用于经理模式与工作区）
           <textarea rows={3} value={value.persona} onChange={(e) => onChange({ ...value, persona: e.target.value })} placeholder="如：你是资深后端架构师，发言聚焦可行性与风险…" />
         </label>
+
+        <section className="settings-block form" aria-labelledby="agent-chat-persona">
+          <h4 id="agent-chat-persona">纯聊天角色设定（娱乐 / 《AI情公寓》）</h4>
+          <label>内置角色预设
+            <select
+              value={value.chatPreset ?? (value.chatPersona?.trim() ? 'custom' : '')}
+              onChange={(e) => {
+                const id = e.target.value
+                const preset = findPersonaPreset(id)
+                onChange({
+                  ...value,
+                  chatPreset: id || undefined,
+                  chatPersona: preset ? preset.prompt : id === 'custom' ? (value.chatPersona ?? '') : undefined
+                })
+              }}
+            >
+              <option value="">默认自然聊天（不使用特殊人设）</option>
+              <optgroup label="《AI情公寓》角色预设（自动附带共用设定与室友关系）">
+                {PERSONA_PRESETS.map((p) => (
+                  <option key={p.id} value={p.id}>{p.name}｜{p.aliases}</option>
+                ))}
+              </optgroup>
+              <option value="custom">自定义纯聊天人设…</option>
+            </select>
+          </label>
+          {(() => {
+            const preset = findPersonaPreset(value.chatPreset)
+            const showTextarea = Boolean(preset || value.chatPreset === 'custom' || value.chatPersona?.trim())
+            return (
+              <>
+                <p className="dim small">
+                  {preset
+                    ? `「${preset.tagline}」—— 仅在「纯聊天」区生效，自动附带《AI情公寓》合租共用设定，不影响办公模式。`
+                    : '仅在「纯聊天」区域生效，可以挑选《AI情公寓》内置角色或自由编写性格，把成员当聊天 AI 玩。'}
+                </p>
+                {showTextarea && (
+                  <>
+                    <textarea
+                      rows={5}
+                      value={value.chatPersona ?? preset?.prompt ?? ''}
+                      onChange={(e) => onChange({
+                        ...value,
+                        chatPreset: value.chatPreset || 'custom',
+                        chatPersona: e.target.value
+                      })}
+                      placeholder="在这里查看、微调角色词条，或编写自己的纯聊天人设…"
+                    />
+                    {preset && (value.chatPersona ?? '').trim() !== preset.prompt.trim() && (
+                      <div className="form-row">
+                        <button
+                          type="button"
+                          className="ghost-btn"
+                          onClick={() => onChange({ ...value, chatPersona: preset.prompt })}
+                        >
+                          恢复 {preset.name} 默认词条
+                        </button>
+                      </div>
+                    )}
+                  </>
+                )}
+              </>
+            )
+          })()}
+        </section>
       </div>
       <EditorFooter saving={saving} disabled={!ready || fetching} message={saveError || (!nameOk && value.name.trim() ? '显示名称不能含空格。' : undefined)} onCancel={onCancel} />
     </form>

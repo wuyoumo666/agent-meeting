@@ -2,8 +2,9 @@ import { randomUUID } from 'node:crypto'
 import { lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import type { Agent, AgentSession, AppEvent, Attachment, HistoryPage, MemoryRecord, Message, Provider, Room, WorkTarget, WsLogEntry, WorkspaceRun, WorkspaceState } from '../shared/types'
-import { GLOBAL_MEMORY_KEY, moderatorReady, REPLY_STYLE } from '../shared/types'
+import { GLOBAL_MEMORY_KEY, isPureChatRoom, moderatorReady, REPLY_STYLE } from '../shared/types'
 import { findMentions } from '../shared/mentions'
+import { buildPureChatPersonaSection } from '../shared/personas'
 import type { Store, WorkHandoff } from './store'
 import { abortable } from './abortable'
 import { chatOnce, type ContentPart, type AgentMsg, type ToolDef } from './adapters/openai'
@@ -499,12 +500,14 @@ export class Orchestrator {
       color: '#cccccc', text: trimmed, ts: Date.now(), kind: 'chat',
       attachments: atts.length > 0 ? atts : undefined
     }
-    if (room.kind !== 'dm' && moderatorReady(this.store.getModerator())) {
+    const pureChat = isPureChatRoom(room)
+    if (!pureChat && room.kind !== 'dm' && moderatorReady(this.store.getModerator())) {
       this.postUserMessage(m)
       this.manager.receive(m)
       return
     }
     if (sendToWorkspace) {
+      if (pureChat) throw new Error('纯聊天区不支持派发工作区任务，请切换到办公区。')
       const mentions = this.findMentions(room, trimmed)
       let first = mentions[0]
       if (!first && room.kind === 'dm') {
@@ -531,7 +534,7 @@ export class Orchestrator {
     const addressed = prefix && trimmed.startsWith(prefix) ? trimmed.slice(prefix.length).trim() : ''
     const instruction = /^(?:[：:]\s*)?(?:请\s*)?(?:去|到|进入|在)工作区\s*[：:，,]?\s*(.*)$/s.exec(addressed)
     const task = instruction?.[1].trim() ?? addressed
-    if (firstMention && (instruction || directLiteratureQuery(task))) {
+    if (!pureChat && firstMention && (instruction || directLiteratureQuery(task))) {
       if (!task || /^[吗嘛呢？?。！!]+$/.test(task)) {
         this.postSystem(roomId, '请在「去工作区」后写上具体任务。')
         return
@@ -539,10 +542,17 @@ export class Orchestrator {
       this.dispatchWork(roomId, firstMention.id, this.taskWithAttachments(firstMention, task, atts), undefined, m.id)
       return
     }
+    const broadcastAll = room.kind === 'chat-group' && /(?:^|[^\w.+%-])@(?:全体|大家|所有人)(?![\p{L}\p{N}_-])/u.test(trimmed)
     const containsMention = /(?:^|[^\w.+%-])@[\p{L}\p{N}_-]/u.test(trimmed)
     // @ 只走聊天；要干活请点「派活」开关，或明确说「去工作区 / 查文献：」
-    const targets = mentioned.length > 0 ? mentioned : containsMention ? [] : this.primaryRespondent(room)
-    if (mentioned.length === 0 && containsMention) {
+    const targets = mentioned.length > 0
+      ? mentioned
+      : broadcastAll
+        ? [...room.participantIds]
+        : containsMention
+          ? []
+          : this.primaryRespondent(room)
+    if (mentioned.length === 0 && !broadcastAll && containsMention) {
       this.postSystem(roomId, '没有找到被点名的参会者。可点击上方名字，或输入 @ 选择。')
     }
     if (targets.length === 0) {
@@ -586,7 +596,10 @@ export class Orchestrator {
     rt.queue = []
     rt.autoTurns = MAX_AUTO_TURNS
     rt.controller?.abort()
-    if (!moderatorReady(this.store.getModerator()) || this.store.getRoom(roomId)?.kind === 'dm') this.postSystem(roomId, '已停止本轮回复。')
+    const room = this.store.getRoom(roomId)
+    if (!moderatorReady(this.store.getModerator()) || room?.kind === 'dm' || isPureChatRoom(room)) {
+      this.postSystem(roomId, '已停止本轮回复。')
+    }
   }
 
   disposeRoom(roomId: string): void {
@@ -1163,11 +1176,12 @@ export class Orchestrator {
   }
 
   private sessionMessages(room: Room, agent: Agent): { messages: AgentMsg[]; lines: string; maxTs: number } {
+    const pureChat = isPureChatRoom(room)
     const session = this.store.getAgentSession(room.id, agent.id)
     const { lines, maxTs, images } = this.newRoomLines(room, agent, session.lastSeenTs)
-    const sys =
-      this.rules(room, agent) +
-      (session.summary ? `\n\n【你此前会话的交接摘要】\n${session.summary}` : '')
+    const sys = pureChat
+      ? (this.pureChatRules(room, agent) + (session.summary ? `\n\n【你们此前的聊天回忆】\n${session.summary}` : ''))
+      : (this.rules(room, agent) + (session.summary ? `\n\n【你此前会话的交接摘要】\n${session.summary}` : ''))
     const messages: AgentMsg[] = [{ role: 'system', content: sys }]
     const recent = []
     let chars = 0
@@ -1179,10 +1193,14 @@ export class Orchestrator {
       recent.unshift({ role: e.role, content })
     }
     messages.push(...recent)
-    const promptText = (lines
-      ? `本会话自你上次发言后的新消息：\n${lines}`
-      : '（没有新消息。你可以继续推进，或保持沉默。）') +
-      '\n\n本轮优先回答最新用户消息。用户只问进度、原因或概念时，核对必要信息后直接答复。历史中的待办只有在用户要求继续执行时才接着做。用户明确要求你做的事，直接调用工具完成。' + this.handoffNotice(room.id)
+    const promptText = pureChat
+      ? (lines
+        ? `最新聊天消息：\n${lines}\n\n请直接以你的人设和口吻自然接话回复，像真实聊天一样互动，不要用办公助手腔或工作报告格式。`
+        : '（没有新消息，自然接话或保持沉默。）')
+      : ((lines
+        ? `本会话自你上次发言后的新消息：\n${lines}`
+        : '（没有新消息。你可以继续推进，或保持沉默。）') +
+        '\n\n本轮优先回答最新用户消息。用户只问进度、原因或概念时，核对必要信息后直接答复。历史中的待办只有在用户要求继续执行时才接着做。用户明确要求你做的事，直接调用工具完成。' + this.handoffNotice(room.id))
     messages.push({
       role: 'user',
       content: images.length ? [{ type: 'text' as const, text: promptText }, ...images] : promptText
@@ -1651,11 +1669,12 @@ export class Orchestrator {
 
   /** 每轮讨论都是一个有界工具循环（对齐 grok-bot 的 agent loop） */
   private async apiTurn(room: Room, agent: Agent, signal: AbortSignal): Promise<{ text: string; lines: string; maxTs: number; notes: string[]; interruption?: string }> {
+    const pureChat = isPureChatRoom(room)
     const provider = agent.providerId ? this.store.getProvider(agent.providerId) : undefined
     if (!provider) throw new Error('未配置模型服务（设置 → 模型服务）')
     if (!agent.model) throw new Error('未选择模型')
     const { messages, lines, maxTs } = this.sessionMessages(room, agent)
-    const mcp = await openMcpServers(agent.access === 'readonly' ? '' : this.store.getMcpConfigPath(), signal)
+    const mcp = await openMcpServers(pureChat || agent.access === 'readonly' ? '' : this.store.getMcpConfigPath(), signal)
     const onRetry = (text: string): void => this.broadcastActivity(room.id, agent, text)
     const observeTool = toolObserver(this.broadcast, room.id, agent.name)
     const modelStats = { onModelRate: modelRateObserver(this.broadcast, room.id, agent.name) }
@@ -1669,7 +1688,7 @@ export class Orchestrator {
         type: 'function',
         function: { name: t.name, description: t.description, parameters: t.parameters }
       }))
-      const tools = [...this.discussionTools(agent), ...mcpTools]
+      const tools = pureChat ? [] : [...this.discussionTools(agent), ...mcpTools]
       const allowedTools = new Set(tools.map((tool) => tool.function.name))
       let imageFallbackTried = false
       for (let step = 0; step < 8; step++) {
@@ -1787,6 +1806,7 @@ export class Orchestrator {
 
   /** 上下文快要丢弃旧消息时，让主持人把它们压缩成「项目进度」长期记忆 */
   private async maybeCompact(roomId: string): Promise<void> {
+    if (isPureChatRoom(this.store.getRoom(roomId))) return
     const mod = this.store.getModerator()
     if (!mod.enabled || !mod.baseUrl.trim() || !mod.model.trim()) return
     if (this.compacting.has(roomId)) return
@@ -1959,6 +1979,27 @@ export class Orchestrator {
     }
   }
 
+  private pureChatRules(room: Room, agent: Agent): string {
+    const roomAgents = room.participantIds
+      .map((id) => this.store.getAgent(id))
+      .filter((a): a is Agent => a != null)
+    const names = roomAgents.map((a) => a.name).join('、')
+    const scene = room.kind === 'chat-dm'
+      ? `这是你（「${agent.name}」）与人类用户（「我」）的 1 对 1 纯聊天私聊。这里不是办公区，没有经理、没有派活、没有工作区任务，只是日常聊天。`
+      : `这是纯聊天群「${room.name}」，在场成员有：${names}，人类用户在群里叫「我」。这里不是办公区，没有经理、没有工作任务，只是轻松聊天互动。你的名字是「${agent.name}」。`
+    const persona = buildPureChatPersonaSection(agent, roomAgents)
+    const chatGuidelines = [
+      '聊天规则：',
+      '- 纯聊天区专注对话、陪伴、玩梗和情绪互动：不要调用文件、命令行或工作区工具，不要汇报进度、路径或验证步骤，也不要使用机械的“请问有什么我可以帮您”助手腔。',
+      '- 语气自然、口语化、有个性、有来有往；用户发送图片或文字材料时可直接围绕内容聊天或吐槽。',
+      ...(room.kind === 'chat-group'
+        ? ['- 若群里已经多人接过同一句话且你此刻没有新话想接，可只回复 [SKIP]（不要加标点或额外说明）。']
+        : [])
+    ].join('\n')
+    const block = this.memoryBlock(room)
+    return [scene, persona, chatGuidelines, block ? `【此前聊过的记住的小事】\n${block}` : ''].filter(Boolean).join('\n\n')
+  }
+
   private rules(room: Room, agent: Agent): string {
     const names = room.participantIds
       .map((id) => this.store.getAgent(id)?.name)
@@ -1999,7 +2040,9 @@ export class Orchestrator {
   }
 
   private memoryItemsForRoom(roomId: string): Array<{ roomId: string; m: MemoryRecord }> {
-    return [GLOBAL_MEMORY_KEY, roomId].flatMap((id) =>
+    const room = this.store.getRoom(roomId)
+    const keys = isPureChatRoom(room) ? [roomId] : [GLOBAL_MEMORY_KEY, roomId]
+    return keys.flatMap((id) =>
       this.store.getMemories(id).map((m) => ({ roomId: id, m }))
     )
   }
@@ -2026,8 +2069,8 @@ export class Orchestrator {
       const source = item.roomId === GLOBAL_MEMORY_KEY
         ? '全局'
         : item.roomId === room.id
-          ? (room.kind === 'dm' ? '本私聊' : '本群')
-          : `${this.store.getRoom(item.roomId)?.kind === 'dm' ? '私聊' : '群'}「${this.store.getRoom(item.roomId)?.name ?? '其他会话'}」`
+          ? (room.kind === 'dm' || room.kind === 'chat-dm' ? '本私聊' : room.kind === 'chat-group' ? '本聊天群' : '本群')
+          : `${this.store.getRoom(item.roomId)?.kind === 'dm' || this.store.getRoom(item.roomId)?.kind === 'chat-dm' ? '私聊' : '群'}「${this.store.getRoom(item.roomId)?.name ?? '其他会话'}」`
       const line = `- [${source}${item.m.pinned ? '·置顶' : ''}] ${text}`
       if (chars + line.length > 4000) continue
       lines.push(line)
@@ -2143,25 +2186,40 @@ export class Orchestrator {
         }
         const lines = this.historyLines(roomId, agent, session.lastSeenTs)
         const lastSeenTs = this.store.getMessages(roomId).at(-1)?.ts ?? Date.now()
-        const prompt =
-          this.rules(room, agent) +
-          '\n\n（附件标记为本地路径时，如果有可用的对应工具、回复又需要该附件，可尝试打开；引用前确认工具实际返回了内容。）' +
-          '\n\n普通聊天只发言。需要工具时用 agent_meeting：文本用 read_file，图片用 view_image，PDF 视觉检查用 view_pdf（page 从 1 开始）。只读模式也能看图；不能用文本读取图片，不能把文字提取说成视觉检查。其他工具包括 list_dir、search_literature、fetch_url、download_file、run_command。动手后汇报实际结果。记忆默认 scope=room。' +
-          `共享工作目录是 ${this.store.getWorkDir() || '（未设置）'}；读文件先 ls/Read 实际确认，不要凭猜测说读不到。` +
-          '若工具被拒绝，说明哪项操作缺少权限，继续回答可用材料足以回答的部分。' +
-          '\n\n' +
-          (session.lastSeenTs ? '在你上次发言之后的新消息：\n' : '会议记录节选：\n') +
-          (lines || '（暂无新消息，请主动推进讨论）') +
-          `\n\n请以「${agent.name}」的身份回答最新用户消息。用户只问进度、原因或概念时，核对必要信息后直接答复。历史中的待办只有在用户要求继续执行时才接着做。用户明确要求你做的事，直接调用工具完成。` + this.handoffNotice(roomId)
-        const r = await runCli(agent, prompt, session.sessionId, onDelta, onStatus, signal, this.store.getWorkDir(), {
-          autonomous: true,
-          agentic: true,
-          onModelRate: modelRateObserver(this.broadcast, roomId, agent.name),
-          mcpConfig: this.mcpConfigFor(roomId, agent.id),
-          onLog: (kind, text) => {
-            if (kind === 'tool') this.broadcastActivity(roomId, agent, text)
+        const pureChat = isPureChatRoom(room)
+        const sysPrompt = pureChat ? this.pureChatRules(room, agent) : ''
+        const claudeSession = agent.cli?.session === 'claude'
+        const prompt = pureChat
+          ? (claudeSession ? '' : sysPrompt + '\n\n') +
+            (session.lastSeenTs ? '在你上次发言之后的新消息：\n' : '此前聊天记录：\n') +
+            (lines || '（暂无新消息）') +
+            `\n\n请以「${agent.name}」的当前设定与口吻自然接话回复，不要调用任何工作区/文件/命令行工具，也不要使用办公助手或工作汇报口吻。`
+          : this.rules(room, agent) +
+            '\n\n（附件标记为本地路径时，如果有可用的对应工具、回复又需要该附件，可尝试打开；引用前确认工具实际返回了内容。）' +
+            '\n\n普通聊天只发言。需要工具时用 agent_meeting：文本用 read_file，图片用 view_image，PDF 视觉检查用 view_pdf（page 从 1 开始）。只读模式也能看图；不能用文本读取图片，不能把文字提取说成视觉检查。其他工具包括 list_dir、search_literature、fetch_url、download_file、run_command。动手后汇报实际结果。记忆默认 scope=room。' +
+            `共享工作目录是 ${this.store.getWorkDir() || '（未设置）'}；读文件先 ls/Read 实际确认，不要凭猜测说读不到。` +
+            '若工具被拒绝，说明哪项操作缺少权限，继续回答可用材料足以回答的部分。' +
+            '\n\n' +
+            (session.lastSeenTs ? '在你上次发言之后的新消息：\n' : '会议记录节选：\n') +
+            (lines || '（暂无新消息，请主动推进讨论）') +
+            `\n\n请以「${agent.name}」的身份回答最新用户消息。用户只问进度、原因或概念时，核对必要信息后直接答复。历史中的待办只有在用户要求继续执行时才接着做。用户明确要求你做的事，直接调用工具完成。` + this.handoffNotice(roomId)
+        const r = await runCli(agent, prompt, session.sessionId, onDelta, onStatus, signal, this.store.getWorkDir(), pureChat
+          ? {
+            pureChat: true,
+            systemPrompt: claudeSession ? sysPrompt : undefined,
+            autonomous: false,
+            agentic: false,
+            onModelRate: modelRateObserver(this.broadcast, roomId, agent.name)
           }
-        })
+          : {
+            autonomous: true,
+            agentic: true,
+            onModelRate: modelRateObserver(this.broadcast, roomId, agent.name),
+            mcpConfig: this.mcpConfigFor(roomId, agent.id),
+            onLog: (kind, text) => {
+              if (kind === 'tool') this.broadcastActivity(roomId, agent, text)
+            }
+          })
         finalText = r.text
         signal.throwIfAborted()
         session.sessionId = r.toolFallback ? undefined : r.sessionId

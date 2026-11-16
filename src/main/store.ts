@@ -461,13 +461,13 @@ export class Store {
     if (i >= 0) this.db.agents[i] = a
     else this.db.agents.push(a)
     for (const r of this.db.rooms) {
-      if (r.kind === 'dm' && r.participantIds.includes(a.id)) r.name = a.name
+      if ((r.kind === 'dm' || r.kind === 'chat-dm') && r.participantIds.includes(a.id)) r.name = a.name
     }
     this.save()
   }
   deleteAgent(id: string): void {
     this.db.agents = this.db.agents.filter((x) => x.id !== id)
-    this.db.rooms = this.db.rooms.filter((r) => !(r.kind === 'dm' && r.participantIds.includes(id)))
+    this.db.rooms = this.db.rooms.filter((r) => !((r.kind === 'dm' || r.kind === 'chat-dm') && r.participantIds.includes(id)))
     for (const r of this.db.rooms) r.participantIds = r.participantIds.filter((x) => x !== id)
     if (this.db.agentSessions) {
       for (const key of Object.keys(this.db.agentSessions)) {
@@ -477,17 +477,17 @@ export class Store {
     this.save()
   }
 
-  /** 取或建一个 bot 的私聊会话 */
-  ensureDm(agentId: string): string | undefined {
+  /** 取或建一个 bot 的私聊或纯聊天单聊会话 */
+  ensureDm(agentId: string, kind: 'dm' | 'chat-dm' = 'dm'): string | undefined {
     const agent = this.db.agents.find((a) => a.id === agentId)
     if (!agent) return undefined
-    const existing = this.db.rooms.find((r) => r.kind === 'dm' && r.participantIds.includes(agentId))
+    const existing = this.db.rooms.find((r) => r.kind === kind && r.participantIds.includes(agentId))
     if (existing) {
       if (existing.archivedAt) this.setRoomArchived(existing.id, false)
       return existing.id
     }
     const room: Room = {
-      id: randomUUID(), name: agent.name, participantIds: [agentId], createdAt: Date.now(), kind: 'dm'
+      id: randomUUID(), name: agent.name, participantIds: [agentId], createdAt: Date.now(), kind
     }
     this.db.rooms.push(room)
     this.save()

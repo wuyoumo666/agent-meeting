@@ -1,6 +1,7 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { moderatorReady } from '../../shared/types'
+import { isPureChatRoom, moderatorReady } from '../../shared/types'
 import type { ActivityEntry, AgentWorkInfo, AppEvent, AppState, ManagerProject, Message, Room, WorkspaceState } from '../../shared/types'
+import { personaDisplayLabel } from '../../shared/personas'
 import Chat, { type RoomDraft } from './components/Chat'
 import ConfirmDialog, { type Confirmation } from './components/ConfirmDialog'
 import { agentColors } from './identity'
@@ -76,7 +77,8 @@ export default function App(): React.JSX.Element {
   const [archivePending, setArchivePending] = useState('')
   const [archiveError, setArchiveError] = useState('')
   const [dmError, setDmError] = useState('')
-  const [roomModal, setRoomModal] = useState<Room | 'new' | null>(null)
+  const [sideArea, setSideArea] = useState<'office' | 'chat'>('office')
+  const [roomModal, setRoomModal] = useState<{ room: Room | null; defaultKind?: 'group' | 'chat-group' } | null>(null)
   const [confirmation, setConfirmation] = useState<Confirmation | null>(null)
   const discussionListener = useRef<((event: ChatEvent) => void) | null>(null)
   const roomIdRef = useRef('')
@@ -266,7 +268,7 @@ export default function App(): React.JSX.Element {
   const participants = useMemo(() => room && state
     ? room.participantIds.map((id) => state.agents.find((a) => a.id === id)).filter((a) => a != null)
     : [], [room, state])
-  const groups = useMemo(() => (state?.rooms.filter((r) => r.kind !== 'dm' && !r.archivedAt) ?? [])
+  const groups = useMemo(() => (state?.rooms.filter((r) => (!r.kind || r.kind === 'group') && !r.archivedAt) ?? [])
     .sort((a, b) => Number(Boolean(unreadByRoom[b.id])) - Number(Boolean(unreadByRoom[a.id]))), [state, unreadByRoom])
   const dmRooms = useMemo(() => state?.rooms.filter((r) => r.kind === 'dm') ?? [], [state])
   const dmAgents = useMemo(() => (state?.agents.filter((a) => a.kind !== 'demo') ?? [])
@@ -275,6 +277,17 @@ export default function App(): React.JSX.Element {
       const br = dmRooms.find((r) => r.participantIds.includes(b.id))
       return Number(Boolean(br && unreadByRoom[br.id])) - Number(Boolean(ar && unreadByRoom[ar.id]))
     }), [state, dmRooms, unreadByRoom])
+  const chatGroups = useMemo(() => (state?.rooms.filter((r) => r.kind === 'chat-group' && !r.archivedAt) ?? [])
+    .sort((a, b) => Number(Boolean(unreadByRoom[b.id])) - Number(Boolean(unreadByRoom[a.id]))), [state, unreadByRoom])
+  const chatDmRooms = useMemo(() => state?.rooms.filter((r) => r.kind === 'chat-dm') ?? [], [state])
+  const chatDmAgents = useMemo(() => (state?.agents.filter((a) => a.kind !== 'demo') ?? [])
+    .sort((a, b) => {
+      const ar = chatDmRooms.find((r) => r.participantIds.includes(a.id))
+      const br = chatDmRooms.find((r) => r.participantIds.includes(b.id))
+      return Number(Boolean(br && unreadByRoom[br.id])) - Number(Boolean(ar && unreadByRoom[ar.id]))
+    }), [state, chatDmRooms, unreadByRoom])
+  const officeUnread = useMemo(() => (state?.rooms ?? []).some((r) => !isPureChatRoom(r) && Boolean(unreadByRoom[r.id])), [state, unreadByRoom])
+  const chatUnread = useMemo(() => (state?.rooms ?? []).some((r) => isPureChatRoom(r) && Boolean(unreadByRoom[r.id])), [state, unreadByRoom])
   const archivedRooms = useMemo(() => (state?.rooms.filter((r) => r.archivedAt) ?? [])
     .sort((a, b) => (b.archivedAt ?? 0) - (a.archivedAt ?? 0)), [state])
   useEffect(() => {
@@ -315,20 +328,24 @@ export default function App(): React.JSX.Element {
   }
 
   const chooseRoom = (id: string): void => {
+    const target = state.rooms.find((r) => r.id === id)
+    if (target) setSideArea(isPureChatRoom(target) ? 'chat' : 'office')
     setRoomId(id)
     setNavOpen(false)
   }
 
-  const openDm = async (agentId: string, existing?: Room): Promise<void> => {
+  const openDm = async (agentId: string, existing?: Room, kind: 'dm' | 'chat-dm' = 'dm'): Promise<void> => {
     setDmError('')
+    setSideArea(kind === 'chat-dm' ? 'chat' : 'office')
     if (existing && !existing.archivedAt) {
       chooseRoom(existing.id)
       return
     }
     try {
-      const id = await window.api.ensureDm(agentId)
+      const id = await window.api.ensureDm(agentId, kind)
       if (!id) throw new Error('找不到成员')
-      chooseRoom(id)
+      setRoomId(id)
+      setNavOpen(false)
     } catch {
       setDmError('暂时无法打开这段私聊，请重试。')
     }
@@ -377,51 +394,126 @@ export default function App(): React.JSX.Element {
           <Icon name={inDrawer ? 'close' : 'panel'} />
         </button>
       </div>
-      <button className="ghost-btn drawer-new" aria-label="新建群聊" onClick={() => { if (inDrawer) setNavOpen(false); setRoomModal('new') }}>
-        <Icon name="plus" />新建群聊
+      <div className="side-area-tabs" role="tablist" aria-label="区域切换">
+        <button
+          role="tab"
+          aria-selected={sideArea === 'office'}
+          className={sideArea === 'office' ? 'side-area-tab active' : 'side-area-tab'}
+          onClick={() => setSideArea('office')}
+        >
+          办公区
+          {sideArea !== 'office' && officeUnread && <span className="unread-dot" title="办公区有新消息" />}
+        </button>
+        <button
+          role="tab"
+          aria-selected={sideArea === 'chat'}
+          className={sideArea === 'chat' ? 'side-area-tab active' : 'side-area-tab'}
+          onClick={() => setSideArea('chat')}
+        >
+          纯聊天
+          {sideArea !== 'chat' && chatUnread && <span className="unread-dot" title="纯聊天有新消息" />}
+        </button>
+      </div>
+      <button
+        className="ghost-btn drawer-new"
+        aria-label={sideArea === 'chat' ? '新建聊天群' : '新建群聊'}
+        onClick={() => {
+          if (inDrawer) setNavOpen(false)
+          setRoomModal({ room: null, defaultKind: sideArea === 'chat' ? 'chat-group' : 'group' })
+        }}
+      >
+        <Icon name="plus" />{sideArea === 'chat' ? '新建聊天群' : '新建群聊'}
       </button>
       <div className="side-conversations">
-        <div className="side-section">
-          <span>群聊</span><span className="side-count">{groups.length}</span>
-        </div>
-        <nav className="room-list" aria-label="群聊">
-          {groups.map((r) => (
-            <div key={r.id} className={r.id === roomId ? 'room-item active' : 'room-item'}>
-              <button className="room-select" aria-current={r.id === roomId ? 'page' : undefined} title={r.name} onClick={() => chooseRoom(r.id)}>
-                <Icon name="chat" className="room-icon" /><span className="room-name">{r.name}</span>
-                {!!unreadByRoom[r.id] && <span className="unread-dot" title={`${unreadByRoom[r.id]} 条新消息`} />}
-              </button>
-              <button className="room-del icon-btn" aria-label={`删除会议室 ${r.name}`} title="删除会议室" onClick={() => confirmDeleteRoom(r)}>×</button>
+        {sideArea === 'office' ? (
+          <>
+            <div className="side-section">
+              <span>群聊</span><span className="side-count">{groups.length}</span>
             </div>
-          ))}
-          {groups.length === 0 && <p className="side-hint dim">{archivedRooms.some((r) => r.kind !== 'dm') ? '群聊已收进归档' : '还没有群聊，点上方新建'}</p>}
-        </nav>
-        <div className="side-section">
-          <span>私聊</span><span className="side-count">{dmAgents.length}</span>
-        </div>
-        <nav className="room-list" aria-label="私聊">
-          {dmAgents.map((a) => {
-            const dm = dmRooms.find((r) => r.participantIds.includes(a.id))
-            return (
-              <div key={a.id} className={dm?.id === roomId ? 'room-item active' : 'room-item'}>
-                <button
-                  className="room-select"
-                  title={`和 ${a.name} 私聊`}
-                  aria-current={dm?.id === roomId ? 'page' : undefined}
-                  onClick={() => void openDm(a.id, dm)}
-                >
-                  <span className="avatar sm" style={{ '--identity': colors.get(a.id) } as React.CSSProperties} aria-hidden="true">{a.name.slice(0, 1)}</span>
-                  <span className="room-name">{a.name}</span>
-                  {dm && !!unreadByRoom[dm.id] && <span className="unread-dot" title={`${unreadByRoom[dm.id]} 条新消息`} />}
-                  {dm?.archivedAt
-                    ? <span className="dim small" title="点击恢复并继续原私聊">已归档</span>
-                    : a.access === 'readonly' && <span className="dim small">只读</span>}
-                </button>
-              </div>
-            )
-          })}
-          {dmAgents.length === 0 && <p className="side-hint dim">还没有参会者</p>}
-        </nav>
+            <nav className="room-list" aria-label="群聊">
+              {groups.map((r) => (
+                <div key={r.id} className={r.id === roomId ? 'room-item active' : 'room-item'}>
+                  <button className="room-select" aria-current={r.id === roomId ? 'page' : undefined} title={r.name} onClick={() => chooseRoom(r.id)}>
+                    <Icon name="chat" className="room-icon" /><span className="room-name">{r.name}</span>
+                    {!!unreadByRoom[r.id] && <span className="unread-dot" title={`${unreadByRoom[r.id]} 条新消息`} />}
+                  </button>
+                  <button className="room-del icon-btn" aria-label={`删除会议室 ${r.name}`} title="删除会议室" onClick={() => confirmDeleteRoom(r)}>×</button>
+                </div>
+              ))}
+              {groups.length === 0 && <p className="side-hint dim">{archivedRooms.some((r) => !isPureChatRoom(r) && r.kind !== 'dm') ? '群聊已收进归档' : '还没有群聊，点上方新建'}</p>}
+            </nav>
+            <div className="side-section">
+              <span>私聊</span><span className="side-count">{dmAgents.length}</span>
+            </div>
+            <nav className="room-list" aria-label="私聊">
+              {dmAgents.map((a) => {
+                const dm = dmRooms.find((r) => r.participantIds.includes(a.id))
+                return (
+                  <div key={a.id} className={dm?.id === roomId ? 'room-item active' : 'room-item'}>
+                    <button
+                      className="room-select"
+                      title={`和 ${a.name} 办公私聊`}
+                      aria-current={dm?.id === roomId ? 'page' : undefined}
+                      onClick={() => void openDm(a.id, dm, 'dm')}
+                    >
+                      <span className="avatar sm" style={{ '--identity': colors.get(a.id) } as React.CSSProperties} aria-hidden="true">{a.name.slice(0, 1)}</span>
+                      <span className="room-name">{a.name}</span>
+                      {dm && !!unreadByRoom[dm.id] && <span className="unread-dot" title={`${unreadByRoom[dm.id]} 条新消息`} />}
+                      {dm?.archivedAt
+                        ? <span className="dim small" title="点击恢复并继续原私聊">已归档</span>
+                        : a.access === 'readonly' && <span className="dim small">只读</span>}
+                    </button>
+                  </div>
+                )
+              })}
+              {dmAgents.length === 0 && <p className="side-hint dim">还没有参会者</p>}
+            </nav>
+          </>
+        ) : (
+          <>
+            <div className="side-section">
+              <span>聊天群 · 同台</span><span className="side-count">{chatGroups.length}</span>
+            </div>
+            <nav className="room-list" aria-label="纯聊天群">
+              {chatGroups.map((r) => (
+                <div key={r.id} className={r.id === roomId ? 'room-item active' : 'room-item'}>
+                  <button className="room-select" aria-current={r.id === roomId ? 'page' : undefined} title={r.name} onClick={() => chooseRoom(r.id)}>
+                    <Icon name="chat" className="room-icon" /><span className="room-name">{r.name}</span>
+                    {!!unreadByRoom[r.id] && <span className="unread-dot" title={`${unreadByRoom[r.id]} 条新消息`} />}
+                  </button>
+                  <button className="room-del icon-btn" aria-label={`删除聊天群 ${r.name}`} title="删除聊天群" onClick={() => confirmDeleteRoom(r)}>×</button>
+                </div>
+              ))}
+              {chatGroups.length === 0 && <p className="side-hint dim">点上方「新建聊天群」，可一键拉起《AI情公寓客厅》</p>}
+            </nav>
+            <div className="side-section">
+              <span>各个 AI · 单聊</span><span className="side-count">{chatDmAgents.length}</span>
+            </div>
+            <nav className="room-list" aria-label="纯聊天单聊">
+              {chatDmAgents.map((a) => {
+                const dm = chatDmRooms.find((r) => r.participantIds.includes(a.id))
+                const personaBadge = personaDisplayLabel(a)
+                return (
+                  <div key={a.id} className={dm?.id === roomId ? 'room-item active' : 'room-item'}>
+                    <button
+                      className="room-select"
+                      title={`和 ${a.name} 纯聊天`}
+                      aria-current={dm?.id === roomId ? 'page' : undefined}
+                      onClick={() => void openDm(a.id, dm, 'chat-dm')}
+                    >
+                      <span className="avatar sm" style={{ '--identity': colors.get(a.id) } as React.CSSProperties} aria-hidden="true">{a.name.slice(0, 1)}</span>
+                      <span className="room-name">{a.name}</span>
+                      {personaBadge && <span className="persona-chip-badge">{personaBadge}</span>}
+                      {dm && !!unreadByRoom[dm.id] && <span className="unread-dot" title={`${unreadByRoom[dm.id]} 条新消息`} />}
+                      {dm?.archivedAt && <span className="dim small" title="点击恢复并继续">已归档</span>}
+                    </button>
+                  </div>
+                )
+              })}
+              {chatDmAgents.length === 0 && <p className="side-hint dim">还没有成员，先去设置里添加</p>}
+            </nav>
+          </>
+        )}
         {dmError && <p className="archive-error" role="alert">{dmError}</p>}
         {archivesOpen && <section ref={archiveList} className="archived-conversations" id="archived-conversations" aria-label="已归档会话">
           <div className="side-section"><span>已归档</span></div>
@@ -429,7 +521,7 @@ export default function App(): React.JSX.Element {
             {archivedRooms.map((r) => <div key={r.id} className={r.id === roomId ? 'room-item active' : 'room-item'}>
               <button className="room-select" title={r.name} aria-current={r.id === roomId ? 'page' : undefined} onClick={() => chooseRoom(r.id)}>
                 <Icon name="archive" className="room-icon" />
-                <span className="archived-name"><span className="room-name">{r.name}</span><small>{r.kind === 'dm' ? '私聊' : '群聊'}</small></span>
+                <span className="archived-name"><span className="room-name">{r.name}</span><small>{r.kind === 'dm' ? '办公私聊' : r.kind === 'chat-dm' ? '纯聊单聊' : r.kind === 'chat-group' ? '纯聊群' : '办公群'}</small></span>
                 {!!unreadByRoom[r.id] && <span className="unread-dot" title={`${unreadByRoom[r.id]} 条新消息`} />}
               </button>
               <button className="archive-restore" aria-label={`恢复会话 ${r.name}`} disabled={Boolean(archivePending)} onClick={() => void restoreFromList(r.id)}>{archivePending === r.id ? '恢复中' : '恢复'}</button>
@@ -514,26 +606,25 @@ export default function App(): React.JSX.Element {
             }}
 
             onStop={() => void window.api.stop(room.id)}
-            onEditRoom={() => setRoomModal(room)}
+            onEditRoom={() => setRoomModal({ room })}
             onArchive={() => changeArchive(room.id, true)}
             onRestore={() => changeArchive(room.id, false, true)}
             onDelete={() => confirmDeleteRoom(room)}
             onToggleMember={(id) => void window.api.toggleRoomMember(room.id, id)}
+            onSaveAgent={(agent) => window.api.saveAgent(agent)}
             onSetAccess={(agentId, access) => {
               const agent = state.agents.find((a) => a.id === agentId)
               if (agent) void window.api.saveAgent({ ...agent, access })
             }}
-
-
-
-
           />
         ) : (
           <div className="no-rooms">
             {(isNarrow || !sidebarOpen) && <button className="ghost-btn nav-toggle" onClick={toggleSidebar}><Icon name="panel" />会话</button>}
-            <div className="empty"><h1>{archivedRooms.length ? '会话已收进归档' : '还没有会议室'}</h1>
+            <div className="empty"><h1>{archivedRooms.length ? '会话已收进归档' : (sideArea === 'chat' ? '还没有纯聊天会话' : '还没有会议室')}</h1>
               {archivedRooms.length > 0 && <button className="ghost-btn" onClick={() => { setArchivesOpen(true); if (isNarrow) openNav(); else setSidebarOpen(true) }}>查看已归档</button>}
-              <button className="primary-btn" onClick={() => setRoomModal('new')}>新建会议室</button>
+              <button className="primary-btn" onClick={() => setRoomModal({ room: null, defaultKind: sideArea === 'chat' ? 'chat-group' : 'group' })}>
+                {sideArea === 'chat' ? '新建纯聊天群' : '新建会议室'}
+              </button>
             </div>
           </div>
         )}
@@ -542,7 +633,7 @@ export default function App(): React.JSX.Element {
       <Suspense fallback={<div className="modal-mask"><div className="modal boot">加载中…</div></div>}>
         {settingsOpen && <Settings state={state} initialTab={managerSettings ? 'moderator' : undefined} onClose={() => { setManagerSettings(false); setSettingsOpen(false) }} onConfirm={setConfirmation} />}
 
-        {roomModal && <RoomModal room={roomModal === 'new' ? null : roomModal} agents={state.agents}
+        {roomModal && <RoomModal room={roomModal.room} defaultKind={roomModal.defaultKind} agents={state.agents}
           onClose={() => setRoomModal(null)} onSaved={(id) => { setRoomModal(null); if (id) chooseRoom(id) }} />}
       </Suspense>
       {confirmation && <ConfirmDialog confirmation={confirmation} onClose={() => setConfirmation(null)} />}

@@ -369,8 +369,8 @@ function registerIpc(): void {
     store.saveRoom({ ...room, participantIds })
     stateChanged()
   })
-  ipcMain.handle('dm:ensure', (_e, agentId: string) => {
-    const id = store.ensureDm(agentId)
+  ipcMain.handle('dm:ensure', (_e, agentId: string, kind?: 'dm' | 'chat-dm') => {
+    const id = store.ensureDm(agentId, kind === 'chat-dm' ? 'chat-dm' : 'dm')
     stateChanged()
     return id ?? null
   })
