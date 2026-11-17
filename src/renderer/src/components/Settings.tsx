@@ -335,9 +335,10 @@ function roomKindTitle(r?: Room): string {
 }
 
 function SchedulePanel({ rooms, agents, tasks }: { rooms: Room[]; agents: Agent[]; tasks: ScheduledTask[] }): React.JSX.Element {
-  const firstRoom = rooms.find((r) => !isPureChatRoom(r) && r.kind !== 'dm' && r.participantIds.length > 0) ?? rooms.find((r) => r.participantIds.length > 0)
+  const workRooms = rooms.filter((r) => !isPureChatRoom(r))
+  const firstRoom = workRooms.find((r) => r.kind !== 'dm' && r.participantIds.length > 0) ?? workRooms.find((r) => r.participantIds.length > 0)
   const [roomId, setRoomId] = useState(firstRoom?.id ?? '')
-  const room = rooms.find((r) => r.id === roomId)
+  const room = workRooms.find((r) => r.id === roomId)
   const participants = useMemo(
     () => (room?.participantIds ?? []).map((id) => agents.find((a) => a.id === id)).filter((a): a is Agent => Boolean(a)),
     [room, agents]
@@ -351,7 +352,7 @@ function SchedulePanel({ rooms, agents, tasks }: { rooms: Room[]; agents: Agent[
 
   const changeRoom = (id: string): void => {
     setRoomId(id)
-    const next = rooms.find((r) => r.id === id)
+    const next = workRooms.find((r) => r.id === id)
     const first = next?.participantIds.map((pid) => agents.find((a) => a.id === pid)).find(Boolean)
     setAgentId(first?.id ?? '')
   }
@@ -383,12 +384,12 @@ function SchedulePanel({ rooms, agents, tasks }: { rooms: Room[]; agents: Agent[
   return (
     <div className="form">
       <p className="dim">定时让参会者执行任务，结果会发回所选聊天。请先为执行者设置工作目录。</p>
-      {!rooms.length && <p className="settings-empty">创建会议室后即可添加定时任务。</p>}
-      {!!rooms.length && (
+      {!workRooms.length && <p className="settings-empty">创建办公会话后即可添加定时任务。</p>}
+      {!!workRooms.length && (
         <div className="schedule-form settings-field-grid">
           <label>会议室
             <select value={roomId} onChange={(e) => changeRoom(e.target.value)}>
-              {rooms.map((r) => <option key={r.id} value={r.id}>{roomKindTitle(r)}</option>)}
+              {workRooms.map((r) => <option key={r.id} value={r.id}>{roomKindTitle(r)}</option>)}
             </select>
           </label>
           <label>执行者
@@ -420,6 +421,7 @@ function SchedulePanel({ rooms, agents, tasks }: { rooms: Room[]; agents: Agent[
               <span className="dim small">每 {t.everyMinutes} 分钟</span>
               <button
                 className="ghost-btn"
+                disabled={!t.enabled && isPureChatRoom(r)}
                 onClick={() => void window.api.saveScheduledTask({ ...t, enabled: !t.enabled })}
               >{t.enabled ? '停用' : '启用'}</button>
               <button className="danger-btn" onClick={() => void window.api.deleteScheduledTask(t.id)}>删除</button>

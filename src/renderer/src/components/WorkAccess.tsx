@@ -5,9 +5,9 @@ type Access = NonNullable<Agent['access']>
 
 const modes: Record<Access, { label: string; commands: string; files: string }> = {
   readonly: { label: '只读', commands: '不运行命令', files: '可读取工作目录。' },
-  workspace: { label: '仅工作目录', commands: '每条命令都问你', files: '内置文件工具只能在工作目录内读写。' },
-  'full-approval': { label: '全文件权限', commands: '每条命令都问你', files: '内置文件工具也能读写工作目录之外的文件。' },
-  'auto-review': { label: '自动审查', commands: '先由模型审查命令', files: '内置文件工具也能读写工作目录之外的文件。' },
+  workspace: { label: '仅工作目录', commands: '每条命令都先审查/问你', files: '应用文件工具仅限工作目录（CLI 原生编辑工具不受此限制）。' },
+  'full-approval': { label: '全文件权限', commands: '每条命令都先审查/问你', files: '应用文件工具也能读写工作目录之外（CLI 原生编辑工具不受限）。' },
+  'auto-review': { label: '自动审查', commands: '模型先审，经理终审', files: '应用文件工具也能读写工作目录之外（CLI 原生编辑工具不受限）。' },
   full: { label: '完全信任', commands: '命令直接执行', files: '内置文件工具也能读写工作目录之外的文件。' }
 }
 
@@ -76,7 +76,7 @@ export default function WorkAccess({ agent, reviewer, onChange }: {
               <p>{files}</p>
               <details>
                 <summary>高级设置 · 自动审查说明</summary>
-                <p>{reviewer ? `由${reviewer}审查命令。群聊里可交给经理复审；仍有重大影响或授权缺口时才请你确认。明确危险的命令会被拒绝。` : '没有可用的审查模型。通过应用执行命令时会请你确认。'}</p>
+                <p>{reviewer ? `由${reviewer}审查命令；未放行时由经理终审。常规任务全程自动执行，不会弹出人工确认，明确危险的命令会被拒绝。` : '没有可用的审查模型。通过应用执行命令时会请你确认。'}</p>
               </details>
             </>
           ) : <p>{current.commands}。{files}</p>}

@@ -21,6 +21,7 @@ export interface ToolBridge extends ToolBridgeInfo {
 
 const MAX_BODY = 256 * 1024
 const TOOL_TIMEOUT_MS = 10 * 60 * 1000
+const COMMAND_REQUEST_TIMEOUT_MS = 20 * 60 * 1000
 
 function readBody(req: import('node:http').IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -82,14 +83,14 @@ export async function startToolBridge(
         ? body.args as Record<string, unknown>
         : {}
       const ctl = new AbortController()
-      const timer = setTimeout(() => ctl.abort(), TOOL_TIMEOUT_MS)
+      const timer = setTimeout(() => ctl.abort(), tool === 'run_command' ? COMMAND_REQUEST_TIMEOUT_MS : TOOL_TIMEOUT_MS)
       res.on('close', () => ctl.abort())
       try {
         const result = await orch.runBridgeTool(roomId, agentId, tool, args, ctl.signal, runId)
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ ok: true, result }))
       } catch (e) {
-        if (!res.headersSent) {
+        if (!res.headersSent && !res.destroyed) {
           res.writeHead(200, { 'Content-Type': 'application/json' })
           res.end(JSON.stringify({ ok: false, error: e instanceof Error ? e.message : String(e) }))
         }

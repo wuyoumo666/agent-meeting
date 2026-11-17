@@ -1,8 +1,8 @@
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmdirSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir, homedir } from 'node:os'
-import { dirname, extname, isAbsolute, join, resolve as resolvePath } from 'node:path'
+import { basename, dirname, extname, isAbsolute, join, resolve as resolvePath } from 'node:path'
 import { REPLY_STYLE, type Agent, type ModelRate } from '../../shared/types'
 import { describeTool } from './humanize'
 import { abortable } from '../abortable'
@@ -37,6 +37,7 @@ export interface CliRunOpts {
   onLog?: (kind: 'text' | 'tool' | 'info', text: string) => void
   onModelRate?: (rate: ModelRate) => void
   lastToolActivity?: () => number | undefined
+  toolInProgress?: () => boolean
   /** Acquire the file-mutation lock after CLI-specific configuration queues. */
   exclusive?: <T>(fn: () => Promise<T>) => Promise<T>
 }
@@ -110,10 +111,14 @@ const stripAnsi = (s: string): string => s.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '')
 
 export function spawnCli(command: string, args: string[], cwd?: string): ReturnType<typeof spawn> {
   if (process.platform !== 'win32') return spawn(command, args, { cwd, windowsHide: true })
-  const dirs = [cwd ?? process.cwd(), ...(process.env.PATH ?? '').split(';').filter(Boolean)]
+  const absolute = isAbsolute(command)
+  if (!absolute && /[\\/:]/.test(command)) throw new Error('请填写本地工具的完整路径，或使用已加入 PATH 的命令名。')
+  const dirs = (process.env.PATH ?? '').split(';').map((dir) => dir.trim().replace(/^"(.*)"$/, '$1')).filter(isAbsolute)
   const names = extname(command) ? [command] : [command + '.exe', command + '.com', command + '.cmd', command + '.bat']
-  const file = dirs.flatMap((dir) => names.map((name) => isAbsolute(name) ? name : resolvePath(dir, name)))
-    .find(existsSync)
+  const candidates = absolute ? names : dirs.flatMap((dir) => names.map((name) => resolvePath(dir, name)))
+  const file = candidates.find((candidate) => {
+    try { return statSync(candidate, { throwIfNoEntry: false })?.isFile() === true } catch { return false }
+  })
   if (!file) throw new Error(`找不到命令「${command}」，请检查命令名或填写完整路径`)
   if (!/\.(?:cmd|bat)$/i.test(file)) return spawn(file, args, { cwd, windowsHide: true })
   if ([file, ...args].some((value) => /["%&|<>^!\r\n]/.test(value))) {
@@ -139,7 +144,7 @@ const killTree = (pid: number): void => {
  * - json:          gemini --output-format json，取 response 字段
  * - text:          原始 stdout
  */
-export function runCli(
+export async function runCli(
   agent: Agent,
   prompt: string,
   prevSessionId: string | undefined,
@@ -150,7 +155,22 @@ export function runCli(
   opts?: CliRunOpts
 ): Promise<CliResult> {
   const cfg = agent.cli
-  if (!cfg?.command.trim()) return Promise.reject(new Error('未设置本地工具的启动命令'))
+  if (!cfg?.command.trim()) throw new Error('未设置本地工具的启动命令')
+  if (opts?.pureChat) {
+    const executable = basename(cfg.command.trim(), extname(cfg.command.trim())).toLowerCase()
+    if (cfg.session !== 'claude' || cfg.outputMode !== 'claude-stream' || cfg.promptVia !== 'stdin' ||
+        !['codebuddy', 'claude'].includes(executable)) {
+      throw new Error('这个本地工具无法关闭所有工具。纯聊天请使用 API 成员或支持无工具模式的 CodeBuddy / Claude。')
+    }
+    const directory = mkdtempSync(join(tmpdir(), 'agent-meeting-chat-'))
+    const mcpConfig = join(directory, 'mcp.json')
+    try {
+      writeFileSync(mcpConfig, '{"mcpServers":{}}', 'utf8')
+      return await runCliInner(agent, prompt, prevSessionId, onDelta, onStatus, signal, undefined, { ...opts, directory, mcpConfig })
+    } finally {
+      try { rmSync(mcpConfig, { force: true }); rmdirSync(directory) } catch { /* Keep any other files untouched. */ }
+    }
+  }
   const launch = (): Promise<CliResult> => {
     const run = (options?: CliRunOpts): Promise<CliResult> => {
       const fn = () => runCliInner(agent, prompt, prevSessionId, onDelta, onStatus, signal, fallbackCwd, options)
@@ -233,11 +253,8 @@ function runCliInner(
     signal.throwIfAborted()
     let args = cfg.args
     if (opts?.pureChat) {
-      args = [...args]
-      if (cfg.session === 'claude') {
-        const toolsIdx = args.indexOf('--tools')
-        if (toolsIdx >= 0 && toolsIdx + 1 < args.length) args[toolsIdx + 1] = ''
-      }
+      args = ['-p', '--output-format', 'stream-json', '--verbose', '--tools', '', '--setting-sources', '',
+        '--strict-mcp-config', '--mcp-config', opts.mcpConfig!]
     } else {
       if (opts?.work || opts?.autonomous) args = workArgs(args, cfg.session, opts.readOnlyTask ? 'readonly' : agent.access)
       args = [...args]
@@ -288,6 +305,10 @@ function runCliInner(
     const idleLimit = 5 * 60 * 1000
     let lastOutputAt = Date.now()
     const checkIdle = (): void => {
+      if (opts?.toolInProgress?.()) {
+        idleTimer = setTimeout(checkIdle, 5_000)
+        return
+      }
       const remaining = idleLimit - (Date.now() - Math.max(lastOutputAt, opts?.lastToolActivity?.() ?? 0))
       if (remaining > 0) idleTimer = setTimeout(checkIdle, remaining)
       else stopForTimeout('本地工具连续 5 分钟无活动，已停止。已写入的文件保留。')

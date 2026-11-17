@@ -73,6 +73,13 @@ function normalizeMd(text: string): string {
     .join('')
 }
 
+// dataUrl 重启后不落盘；历史消息里的图片按本地路径渲染
+function imageSrc(a: Attachment): string | undefined {
+  if (a.dataUrl) return a.dataUrl
+  if (a.kind !== 'image' || !a.path) return undefined
+  return 'file:///' + encodeURI(a.path.replaceAll('\\', '/')).replaceAll('#', '%23')
+}
+
 const MessageRow = memo(function MessageRow({ message: m, streaming, color }: { message: Message; streaming: boolean; color: string }) {
   if (m.kind === 'system') return <div id={'msg-' + m.id} className="sys-msg">{m.text}</div>
   if (!m.text && !m.attachments?.length && !streaming) return null
@@ -90,9 +97,12 @@ const MessageRow = memo(function MessageRow({ message: m, streaming, color }: { 
         </div>
         {!!m.attachments?.length && (
           <div className="msg-atts">
-            {m.attachments.map((a, i) => a.kind === 'image' && a.dataUrl
-              ? <img key={i} src={a.dataUrl} className="msg-img" alt={a.name} loading="lazy" decoding="async" />
-              : <span key={i} className="msg-att">{a.name}</span>)}
+            {m.attachments.map((a, i) => {
+              const src = imageSrc(a)
+              return src
+                ? <img key={i} src={src} className="msg-img" alt={a.name} loading="lazy" decoding="async" />
+                : <span key={i} className="msg-att">{a.name}</span>
+            })}
           </div>
         )}
         {!!m.deliveries?.length && <DeliveryCards message={m} />}
@@ -299,7 +309,10 @@ function RunCard({ ws, approvalsOnly, onStop, onStopRun, onApprove }: {
       startedAt: ws.startedAt, endedAt: ws.endedAt, summary: ws.summary, log: ws.log, pending: ws.pending
     }]
   }
-  const visible = runs.filter((r) => r.pending || (!approvalsOnly && (r.status === 'running' || r.status === 'error')))
+  // 只展示最近一条出错的任务，避免旧错误卡片堆积
+  const errorRuns = runs.filter((r) => r.status === 'error')
+  const latestError = errorRuns.at(-1)
+  const visible = runs.filter((r) => r.pending || (!approvalsOnly && (r.status === 'running' || r === latestError)))
   if (!visible.length) return null
   return <div className="run-list" aria-label="任务与审批">{visible.map((run) => (
     <RunItem

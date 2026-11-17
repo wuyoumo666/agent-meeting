@@ -8,11 +8,13 @@ import { fetchUrl, downloadFile } from './netTools'
 import { searchLiterature } from './workWeb'
 import { openMcpServers } from './mcpClient'
 import { resolveWorkspacePath } from '../workspacePath'
+import { CommandFailures } from '../workEvidence'
 import { imageInputError, visualMessage, viewVisualFile, VISUAL_TOOLS, type VisualResult } from './visual'
 import { executeFileTool, FILE_TOOLS, FILE_TOOL_NAMES } from './fileTools'
 import { searchWeb, WEB_SEARCH_TOOL } from './webSearch'
 
 const MAX_STEPS = 30
+type RequestApproval = (command: string, reason: string, workDir: string, shell?: 'bash' | 'cmd') => Promise<(() => void) | undefined>
 const MAX_LITERATURE_SEARCHES = 3
 
 const TOOLS: ToolDef[] = [
@@ -98,13 +100,14 @@ const TOOLS: ToolDef[] = [
     type: 'function',
     function: {
       name: 'run_command',
-      description: '在工作目录执行命令，说明用途和操作对象。Windows 默认优先使用 Git Bash（支持 bash 语法与 Unix 工具），需要 cmd 语法时可传 shell="cmd"。应用会按权限自动审核或请求用户批准，获准后才执行。',
+      description: '在工作目录执行命令，说明用途和操作对象。Windows 默认优先使用 Git Bash（支持 bash 语法与 Unix 工具），需要 cmd 语法时可传 shell="cmd"。应用会按权限自动审核或请求用户批准，获准后执行；默认最长运行 5 分钟。',
       parameters: {
         type: 'object',
         properties: {
           command: { type: 'string', description: '要执行的命令' },
           reason: { type: 'string', description: '这条命令要做什么、为什么需要执行' },
-          shell: { type: 'string', enum: ['bash', 'cmd'], description: '可选：默认 bash（Git Bash）；仅在必须用 Windows cmd 语法时传 cmd' }
+          shell: { type: 'string', enum: ['bash', 'cmd'], description: '可选：默认 bash（Git Bash）；仅在必须用 Windows cmd 语法时传 cmd' },
+          timeoutSeconds: { type: 'integer', minimum: 10, maximum: 600, description: '可选：最长运行秒数，默认 300' }
         },
         required: ['command', 'reason']
       }
@@ -125,7 +128,7 @@ async function executeTool(
   args: Record<string, unknown>,
   workDir: string,
   onLog: (kind: 'text' | 'tool' | 'info' | 'result', text: string) => void,
-  requestApproval: (command: string, reason: string) => Promise<boolean>,
+  requestApproval: RequestApproval,
   recall: ((query: string) => Promise<string>) | undefined,
   signal: AbortSignal,
   access: 'readonly' | 'workspace' | 'full-approval' | 'auto-review' | 'full',
@@ -214,16 +217,19 @@ async function executeTool(
     const cmd = typeof args.command === 'string' ? args.command.trim() : ''
     if (!cmd) throw new Error('命令为空')
     const reason = typeof args.reason === 'string' ? args.reason : ''
+    const timeoutSeconds = Math.min(600, Math.max(10, typeof args.timeoutSeconds === 'number' ? args.timeoutSeconds : 300))
+    const shellPref = args.shell === 'cmd' ? 'cmd' : args.shell === 'bash' ? 'bash' : undefined
+    let verifyApproval: (() => void) | undefined
     if (access !== 'full') {
       onLog('info', `申请执行命令：${cmd}${reason ? '（' + reason + '）' : ''}`)
-      const ok = await requestApproval(cmd, reason)
+      verifyApproval = await requestApproval(cmd, reason, workDir, shellPref)
       signal.throwIfAborted()
-      if (!ok) throw new Error('命令未获批准。可以改用其他已提供的工具。')
+      if (!verifyApproval) throw new Error('命令未获批准。可以改用其他已提供的工具。')
     }
-    const shellPref = args.shell === 'cmd' ? 'cmd' : args.shell === 'bash' ? 'bash' : undefined
     return await mutate(() => {
+      verifyApproval?.()
       onLog('tool', describeTool(name, args))
-      return runShellCommand(workDir, cmd, signal, shellPref)
+      return runShellCommand(workDir, cmd, signal, shellPref, timeoutSeconds * 1000)
     })
   }
   if (name === 'recall_context') {
@@ -271,7 +277,8 @@ export function runShellCommand(
   workDir: string,
   command: string,
   signal: AbortSignal,
-  preferredShell?: 'bash' | 'cmd'
+  preferredShell?: 'bash' | 'cmd',
+  timeoutMs = 300_000
 ): Promise<string> {
   return new Promise((resolveP) => {
     signal.throwIfAborted()
@@ -308,7 +315,7 @@ export function runShellCommand(
       } else child.kill()
       finish(message)
     }
-    const timer = setTimeout(() => stop('命令超时（60 秒），已终止'), 60000)
+    const timer = setTimeout(() => stop(`命令超时（${Math.round(timeoutMs / 1000)} 秒），已终止`), timeoutMs)
     const onAbort = (): void => stop('命令已停止')
     signal.addEventListener('abort', onAbort, { once: true })
     child.stdout.setEncoding('utf8').on('data', (d) => { out = (out + d).slice(-4000) })
@@ -341,8 +348,8 @@ export async function runApiAgent(opts: {
   onModelRate?: (rate: import('../../shared/types').ModelRate) => void
   onToolResult?: (name: string, args: Record<string, unknown>, result: string) => void
   readOnlyTask?: boolean
-  /** 申请执行命令，返回是否允许 */
-  requestApproval: (command: string, reason: string) => Promise<boolean>
+  /** 获准后返回一项检查，在拿到写锁、启动进程之前核对审查过的文件。 */
+  requestApproval: RequestApproval
   /** 向主持人查询上下文 */
   recall?: (query: string) => Promise<string>
   /** 写文件/下载/命令的全局互斥 */
@@ -401,6 +408,7 @@ export async function runApiAgent(opts: {
     { role: 'user', content: opts.images?.length ? [{ type: 'text', text: requestText }, ...opts.images] : requestText }
   ]
   let operated = false
+  const commandFailures = new CommandFailures()
   const searchResults: string[] = []
   let reminderSent = false
   let searchError = ''
@@ -454,7 +462,7 @@ export async function runApiAgent(opts: {
           messages.push({ role: 'user', content: '请现在调用 search_literature 实际检索后再回复。' })
           continue
         }
-        return { summary: text || '（模型未提供总结）', operated, searchResult: searchResults.join('\n\n') }
+        return { summary: text || '（模型未提供总结）', operated, searchResult: searchResults.join('\n\n'), note: commandFailures.unresolved }
       }
       messages.push({ role: 'assistant', content: content || '', tool_calls: toolCalls })
       const pictures: AgentMsg[] = []
@@ -475,7 +483,7 @@ export async function runApiAgent(opts: {
           }
           opts.onToolStart?.(name)
           const output = name.startsWith('mcp__')
-            ? await mcp.call(name, args)
+            ? await mutate(() => mcp.call(name, args))
             : opts.extraTools?.some((tool) => tool.function.name === name) && opts.executeExtraTool
               ? await opts.executeExtraTool(name, args)
               : await executeTool(name, args, workDir, onLog, requestApproval, recall, signal, access, mutate, opts.skillsDir, activity?.transfer)
@@ -490,6 +498,7 @@ export async function runApiAgent(opts: {
         } finally {
           activity?.finish()
         }
+        if (name === 'run_command') commandFailures.record(args, result)
         const brief =
           name === 'read_file' && !result.startsWith('错误:')
             ? `已读取 ${String(args.path ?? '')}（${result.length} 字符）`

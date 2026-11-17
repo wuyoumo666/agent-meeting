@@ -11,6 +11,8 @@ import { spawnCli } from './adapters/cli'
 import { extractDocText } from './adapters/docs'
 import { exportMarkdown, searchHistory } from './history'
 import { OPENABLE_DELIVERY, verifyDelivery } from './managerFiles'
+import { IMAGE_LIMIT, storeImage } from './imageAttachments'
+import { isPureChatRoom } from '../shared/types'
 import type { Agent, AppEvent, Attachment, ModeratorUpdate, ProviderUpdate, Room, RulesFile, ScheduledTask } from '../shared/types'
 
 let win: BrowserWindow | null = null
@@ -279,13 +281,15 @@ function registerIpc(): void {
         const ext = extname(p).toLowerCase()
         const name = basename(p)
         if (IMG.has(ext)) {
-          if (st.size > 12 * 1024 * 1024) {
+          if (st.size > IMAGE_LIMIT) {
             out.push({ name, path: p, kind: 'file', size: st.size })
             continue
           }
           const buf = await readFile(p)
           const mime = ext === '.png' ? 'png' : ext === '.webp' ? 'webp' : ext === '.gif' ? 'gif' : ext === '.bmp' ? 'bmp' : 'jpeg'
-          out.push({ name, path: p, kind: 'image', size: st.size, dataUrl: `data:image/${mime};base64,${buf.toString('base64')}` })
+          const dir = join(app.getPath('userData'), 'attachments')
+          const stored = storeImage(dir, mime, buf)
+          out.push({ name, path: stored, kind: 'image', size: st.size, dataUrl: `data:image/${mime};base64,${buf.toString('base64')}` })
         } else if (DOC.has(ext)) {
           const text = st.size <= 20 * 1024 * 1024 ? await extractDocText(p) : undefined
           out.push({ name, path: p, kind: 'file', size: st.size, text: text ? text.slice(0, 12000) : undefined })
@@ -379,6 +383,7 @@ function registerIpc(): void {
     orchestrator.sendUserMessage(roomId, text, attachments, sendToWorkspace === true))
   ipcMain.handle('chat:stop', (_e, roomId: string) => orchestrator.stop(roomId))
   ipcMain.handle('schedule:save', (_e, task: ScheduledTask) => {
+    if (task.enabled && isPureChatRoom(store.getRoom(task.roomId))) throw new Error('定时任务只能安排到办公会话。')
     store.saveScheduledTask(task)
     stateChanged()
   })
@@ -394,7 +399,8 @@ function registerIpc(): void {
   ipcMain.handle('workspace:stopRun', (_e, runId: string) => orchestrator.stopRun(runId))
   ipcMain.handle('workspace:approve', (_e, roomId: string, id: string, allow: boolean) => orchestrator.approveCommand(roomId, id, allow))
 
-  ipcMain.handle('moderator:save', async (_e, cfg: ModeratorUpdate) => {    await store.setModerator(cfg)
+  ipcMain.handle('moderator:save', async (_e, cfg: ModeratorUpdate) => {
+    await store.setModerator(cfg)
     stateChanged()
   })
 

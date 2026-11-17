@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
-import { dirname, isAbsolute, join, resolve } from 'node:path'
+import { dirname, extname, isAbsolute, join, resolve } from 'node:path'
 import type { Agent, AgentSession, AppEvent, Attachment, HistoryPage, MemoryRecord, Message, Provider, Room, WorkTarget, WsLogEntry, WorkspaceRun, WorkspaceState } from '../shared/types'
 import { GLOBAL_MEMORY_KEY, isPureChatRoom, moderatorReady, REPLY_STYLE } from '../shared/types'
 import { findMentions } from '../shared/mentions'
@@ -9,7 +9,7 @@ import type { Store, WorkHandoff } from './store'
 import { abortable } from './abortable'
 import { chatOnce, type ContentPart, type AgentMsg, type ToolDef } from './adapters/openai'
 import { runCli, readCliModelFromConfig, modelToHandle } from './adapters/cli'
-import { runApiAgent, runShellCommand } from './adapters/apagent'
+import { findGitBash, runApiAgent, runShellCommand } from './adapters/apagent'
 import { downloadFile, fetchUrl } from './adapters/netTools'
 import { describeTool } from './adapters/humanize'
 import { openMcpServers } from './adapters/mcpClient'
@@ -18,9 +18,10 @@ import { checkConnection, searchLiterature } from './adapters/workWeb'
 import { directLiteratureQuery, workIntent } from './workIntent'
 import { searchHistory } from './history'
 import { resolveWorkspacePath } from './workspacePath'
-import { commandInspection, REVIEW_TOOLS } from './commandReview'
+import { commandInspection, REVIEW_TOOLS, type CommandInspection } from './commandReview'
 import { Manager } from './manager'
-import { accessedPage, literatureSources, webSearchSources } from './workEvidence'
+import { accessedPage, CommandFailures, literatureSources, webSearchSources } from './workEvidence'
+import { IMAGE_LIMIT } from './imageAttachments'
 import { imageInputError, visualMessage, viewVisualFile, VISUAL_TOOLS, type VisualResult } from './adapters/visual'
 import { executeFileTool, FILE_TOOLS, FILE_TOOL_NAMES } from './adapters/fileTools'
 import { searchWeb, WEB_SEARCH_TOOL } from './adapters/webSearch'
@@ -96,15 +97,8 @@ export class Orchestrator {
   private coordinator?: Manager
   private get manager(): Manager {
     return this.coordinator ??= new Manager(this.store, {
-      dispatch: (roomId, agentId, task, source, handoff) => {
-        if (handoff.manager?.opinion) {
-          this.dispatchWork(roomId, agentId, task, '', source, handoff)
-          return
-        }
-        const target = this.workTarget(roomId, agentId)
-        if (target.error) throw new Error(target.error)
-        this.dispatchWork(roomId, agentId, task, target.directory, source, handoff)
-      },
+      dispatch: (roomId, agentId, task, source, handoff) =>
+        this.dispatchWork(roomId, agentId, task, undefined, source, handoff),
       cancel: (roomId) => this.cancelManagerWork(roomId),
       roots: (roomId) => {
         const room = this.store.getRoom(roomId)
@@ -140,9 +134,9 @@ export class Orchestrator {
     agentId: string
     handoff?: WorkHandoff
     command?: BridgeCommand
-    lastToolActivity?: number
     recordBridgeTool?: (name: string, args: Record<string, unknown>, result: string) => void
   }>()
+  private bridgeActivity = new WeakMap<AbortSignal, { pending: number; lastAt: number }>()
   /** 全局写入互斥：多个任务可以并行思考/读取，但写文件/跑命令一次一个 */
   private mutationQueue: Promise<void> = Promise.resolve()
   private scheduling = false
@@ -201,7 +195,7 @@ export class Orchestrator {
         if (!task.enabled || task.nextAt > now) continue
         const room = this.store.getRoom(task.roomId)
         const agent = this.store.getAgent(task.agentId)
-        if (!room || !agent || !room.participantIds.includes(task.agentId)) {
+        if (!room || isPureChatRoom(room) || !agent || !room.participantIds.includes(task.agentId)) {
           this.store.saveScheduledTask({ ...task, enabled: false })
           continue
         }
@@ -249,7 +243,8 @@ export class Orchestrator {
   }
 
   /** 权限不够时给出可点的位置，避免用户到处找 */
-  private postPermissionHint(roomId: string, agent: Agent, action: string): void {    this.postSystem(
+  private postPermissionHint(roomId: string, agent: Agent, action: string): void {
+    this.postSystem(
       roomId,
       `💡 ${agent.name} 当前是只读权限，不能${action}。在聊天顶部「权限」下拉里把它调到「沙箱」或更高；群聊在右上角「成员/权限」里改，改完重试即可。`
     )
@@ -317,7 +312,8 @@ export class Orchestrator {
     const rooms = new Map<string, number>()
     for (const p of pending) {
       if (!p.roomId || !p.agentId || !p.task?.trim()) continue
-      if (!this.store.getRoom(p.roomId) || !this.store.getAgent(p.agentId)) continue
+      const room = this.store.getRoom(p.roomId)
+      if (!room || isPureChatRoom(room) || !room.participantIds.includes(p.agentId) || !this.store.getAgent(p.agentId)) continue
       if (this.workQueue.some((w) => w.roomId === p.roomId && w.agentId === p.agentId && w.task === p.task)) continue
       this.workQueue.push({
         roomId: p.roomId,
@@ -374,6 +370,7 @@ export class Orchestrator {
     if (!room || !agent || agent.kind !== 'cli' || !room.participantIds.includes(agentId)) {
       throw new Error('无效的 bot 会话，请重新打开私聊或群聊')
     }
+    if (isPureChatRoom(room)) throw new Error('纯聊天区不提供工作区工具。')
     const rt = this.rt(roomId)
     const run = runId ? this.activeRuns.get(runId) : undefined
     const parent = runId ? this.wsCtl.get(runId)?.signal : rt.activeAgentId === agentId ? rt.controller?.signal : undefined
@@ -383,7 +380,6 @@ export class Orchestrator {
     if (!parent) throw new Error('当前没有对应的执行回合，旧工具连接不能启动新操作。')
     const currentSignal = AbortSignal.any([signal, parent])
     currentSignal.throwIfAborted()
-    if (run) run.lastToolActivity = Date.now()
     const mayWaitForCommand = run && runId && agent.cli?.session === 'agy' && !run.handoff?.manager?.readOnly && agent.access !== 'readonly'
     if (tool === 'wait_command') {
       if (!mayWaitForCommand || !run.command) throw new Error('当前任务没有待返回的命令。')
@@ -404,6 +400,7 @@ export class Orchestrator {
     if (tool === 'run_command' && mayWaitForCommand) {
       if (run.command) return '上一条命令还没有取回结果。请用 wait_command 继续等待，勿重复执行。'
       const activity = observe(tool, args)
+      const finishBridgeCall = this.beginBridgeCall(parent)
       const controller = new AbortController()
       const runSignal = AbortSignal.any([parent, controller.signal])
       const cancelBeforeHandoff = (): void => controller.abort()
@@ -413,7 +410,10 @@ export class Orchestrator {
         .then((output) => {
           run.recordBridgeTool?.(tool, args, output)
           return output
-        }).finally(activity.finish)
+        }).finally(() => {
+          activity.finish()
+          finishBridgeCall()
+        })
       run.command = { controller, result }
       try {
         return await this.waitBridgeCommand(roomId, runId, currentSignal)
@@ -422,14 +422,30 @@ export class Orchestrator {
       }
     }
     const activity = observe(tool, args)
+    const finishBridgeCall = this.beginBridgeCall(parent)
     try {
       const result = tool === 'view_image' || tool === 'view_pdf'
         ? await this.executeVisualTool(room, reader, tool, args, currentSignal)
         : await this.executeDiscussionTool(room, reader, tool, args, currentSignal, runId, activity.transfer)
       run?.recordBridgeTool?.(tool, args, typeof result === 'string' ? result : result.summary)
       return result
+    } catch (error) {
+      if (tool === 'run_command') run?.recordBridgeTool?.(tool, args, `命令失败：${error instanceof Error ? error.message : String(error)}`)
+      throw error
     } finally {
       activity.finish()
+      finishBridgeCall()
+    }
+  }
+
+  private beginBridgeCall(signal: AbortSignal): () => void {
+    const state = this.bridgeActivity.get(signal) ?? { pending: 0, lastAt: Date.now() }
+    state.pending++
+    state.lastAt = Date.now()
+    this.bridgeActivity.set(signal, state)
+    return () => {
+      state.pending--
+      state.lastAt = Date.now()
     }
   }
 
@@ -449,8 +465,6 @@ export class Orchestrator {
       return pending
         ? '命令正在等待用户批准。审批仍有效，请调用 wait_command 继续等待结果，勿重复执行。'
         : '命令仍在审查或执行。请调用 wait_command 继续等待结果，勿重复执行。'
-    } finally {
-      run.lastToolActivity = Date.now()
     }
   }
 
@@ -836,6 +850,7 @@ export class Orchestrator {
       }
     }
     if (stopped) this.postSystem(roomId, '已停止当前任务。')
+    if (s.pending) this.approvals.get(s.pending.id)?.(false)
   }
 
   stopRun(runId: string): void {
@@ -851,10 +866,11 @@ export class Orchestrator {
     const agent = this.store.getAgent(agentId)
     const pendingMessage = typeof sourceMessage === 'object' ? sourceMessage : undefined
     const reject = (message: string): void => {
-      if (expectedDirectory !== undefined || pendingMessage) throw new Error(message)
+      if (expectedDirectory !== undefined || pendingMessage || handoff?.manager) throw new Error(message)
       this.postSystem(roomId, message)
     }
     if (!room || !agent || !room.participantIds.includes(agentId) || !task.trim()) return reject('请确认参会者和任务内容。')
+    if (isPureChatRoom(room)) return reject('纯聊天区不支持工作区任务。')
     if (agent.kind === 'demo') {
       return reject(`${agent.name} 是离线演示，不能执行工作区任务。`)
     }
@@ -910,7 +926,7 @@ export class Orchestrator {
     if (s.runs!.length > 20) s.runs!.splice(0, s.runs!.length - 20)
     if (!opinion) s.directory = workDir
     let bridgeWorked = false
-    let bridgeCommandFailure: string | undefined
+    const bridgeCommandFailures = new CommandFailures()
     this.activeRuns.set(runId, { roomId, agentId, handoff, recordBridgeTool: (name, args, result) => {
       recordToolResult(name, args, result)
       const confirmed = name === 'write_file' ? result.startsWith('已写入 ')
@@ -918,8 +934,8 @@ export class Orchestrator {
         : name === 'download_file' ? result.startsWith('已下载 ')
         : ['read_file', 'read_document', 'find_files', 'search_files', 'web_search', 'check_capabilities', 'list_dir', 'view_image', 'view_pdf', 'fetch_url', 'search_literature'].includes(name) && !!result && result !== '未配置共享工作目录。'
       if (name === 'run_command') {
-        bridgeCommandFailure = confirmed ? undefined : result.split('\n')[0].slice(0, 250)
-        if (bridgeCommandFailure) onLog('info', `命令未完成：${bridgeCommandFailure}`)
+        const failure = bridgeCommandFailures.record(args, result)
+        if (failure) onLog('info', `命令未完成：${failure}`)
       }
       if (confirmed) {
         bridgeWorked = true
@@ -1003,7 +1019,8 @@ export class Orchestrator {
               executeExtraTool: (name, args) => this.executeDiscussionTool(room, agent, name, args, ctl.signal, runId),
               literature: intent === 'literature',
               mutate: (fn) => this.withMutationLock(ctl.signal, fn, runId),
-              requestApproval: (cmd, why) => this.requestCommandApprovalSmart(roomId, agent, cmd, why, taskText, ctl.signal, runId),
+              requestApproval: (cmd, why, directory, shell) =>
+                this.requestCommandApprovalSmart(roomId, agent, cmd, why, taskText, ctl.signal, directory, shell, runId),
               recall: (q) => this.recallContext(roomId, q, ctl.signal),
               signal: ctl.signal
             })
@@ -1022,7 +1039,8 @@ export class Orchestrator {
             onModelRate,
             agentic: true,
             mcpConfig: this.mcpConfigFor(roomId, agent.id, runId),
-            lastToolActivity: () => this.activeRuns.get(runId)?.lastToolActivity,
+            lastToolActivity: () => this.bridgeActivity.get(ctl.signal)?.lastAt,
+            toolInProgress: () => Boolean(this.bridgeActivity.get(ctl.signal)?.pending),
             exclusive: readOnly ? undefined : (fn) => this.withMutationLock(ctl.signal, async () => {
               try { return await fn() }
               finally {
@@ -1037,7 +1055,7 @@ export class Orchestrator {
           summary = r.text.trim()
           // Only a successful callback to our own bridge is counted as verified activity.
           operated = bridgeWorked
-          workNote = bridgeCommandFailure
+          workNote = bridgeCommandFailures.unresolved
         }
         ctl.signal.throwIfAborted()
         run.status = workNote ? 'error' : operated ? 'done' : 'replied'
@@ -1120,8 +1138,28 @@ export class Orchestrator {
     const all = this.store.getMessages(roomId)
     const end = sourceMessageId ? all.findIndex((m) => m.id === sourceMessageId) : -1
     return (end >= 0 ? all.slice(0, end + 1) : all).filter((m) => m.senderId === 'user').slice(-4)
-      .flatMap((m) => m.attachments ?? []).filter((a) => a.kind === 'image' && a.dataUrl).slice(-2)
-      .map((a) => ({ type: 'image_url', image_url: { url: a.dataUrl! } }))
+      .flatMap((m) => m.attachments ?? []).filter((a) => a.kind === 'image').slice(-2)
+      .flatMap((a) => {
+        const url = this.imageDataUrl(a)
+        return url ? [{ type: 'image_url', image_url: { url } }] : []
+      })
+  }
+
+  /** dataUrl 重启后不落盘；需要时从 attachments 里的稳定副本现读 */
+  private imageDataUrl(a: Attachment): string | undefined {
+    if (a.dataUrl) return a.dataUrl
+    if (a.kind !== 'image' || !a.path) return undefined
+    try {
+      const st = statSync(a.path)
+      if (!st.isFile() || st.size === 0 || st.size > IMAGE_LIMIT) return undefined
+      const buf = readFileSync(a.path)
+      if (buf.length === 0 || buf.length > IMAGE_LIMIT) return undefined
+      const ext = extname(a.path).toLowerCase()
+      const mime = ext === '.png' ? 'png' : ext === '.webp' ? 'webp' : ext === '.gif' ? 'gif' : ext === '.bmp' ? 'bmp' : 'jpeg'
+      return `data:image/${mime};base64,${buf.toString('base64')}`
+    } catch {
+      return undefined
+    }
   }
 
   /** Completion is an explicit input, rather than hoping an @ mention wakes the requester. */
@@ -1188,9 +1226,11 @@ export class Orchestrator {
       lines.unshift(line)
       chars += line.length + 1
       for (const a of m.attachments ?? []) {
-        if (m.ts > sinceTs && a.kind === 'image' && a.dataUrl && !seenImages.has(a.path) && images.length < 2) {
+        if (m.ts > sinceTs && a.kind === 'image' && !seenImages.has(a.path) && images.length < 2) {
+          const url = this.imageDataUrl(a)
+          if (!url) continue
           seenImages.add(a.path)
-          images.push({ type: 'image_url', image_url: { url: a.dataUrl } })
+          images.push({ type: 'image_url', image_url: { url } })
         }
       }
     }
@@ -1294,10 +1334,11 @@ export class Orchestrator {
       ...(writable ? [
         fn('write_file', '在工作目录里创建或覆盖文本文件（按权限档执行）', { path: { type: 'string' }, content: { type: 'string' } }, ['path', 'content']),
         fn('download_file', '从 http/https 网址下载文件到工作目录（最大 50MB）', { url: { type: 'string' }, path: { type: 'string' } }, ['url', 'path']),
-        fn('run_command', '执行一条 shell 命令（Windows 默认使用 Git Bash，可用 bash 语法；需要 cmd 时可传 shell="cmd"。沙箱/完全+审批档会先弹人工审批）', {
+        fn('run_command', '执行一条 shell 命令（Windows 默认使用 Git Bash，可用 bash 语法；需要 cmd 时可传 shell="cmd"。沙箱/完全+审批档会先弹人工审批），默认最长运行 5 分钟', {
           command: { type: 'string' },
           reason: { type: 'string' },
-          shell: { type: 'string', enum: ['bash', 'cmd'], description: '可选：默认 bash（Git Bash），需要 Windows cmd 时传 cmd' }
+          shell: { type: 'string', enum: ['bash', 'cmd'], description: '可选：默认 bash（Git Bash），需要 Windows cmd 时传 cmd' },
+          timeoutSeconds: { type: 'integer', minimum: 10, maximum: 600, description: '可选：最长运行秒数，默认 300' }
         }, ['command', 'reason'])
       ] : []),
       fn('search_history', '在本会议室历史消息里搜索', { query: { type: 'string' } }, ['query']),
@@ -1325,6 +1366,7 @@ export class Orchestrator {
     reason: string,
     purpose: string,
     signal: AbortSignal,
+    execution: { directory: string; shell: string; inspection: CommandInspection },
     firstReview?: string,
     runId?: string,
     forceMain = false
@@ -1381,14 +1423,14 @@ export class Orchestrator {
     const project = assignment ? this.store.getManagerProject(roomId) : undefined
     const originalRequest = project?.id === assignment?.projectId ? project?.request : undefined
     const sourceRequest = handoff?.sourceMessage ? this.store.getMessages(roomId).find((m) => m.id === handoff.sourceMessage && m.senderId === 'user' && m.kind === 'chat')?.text : undefined
-    const directory = this.workTarget(roomId, agent.id).directory
-    const inspection = commandInspection(command, directory, [this.store.getWorkDir()])
+    const { directory, shell, inspection } = execution
     const user =
       `任务目的：${run?.task || purpose || '（未提供）'}\n` +
       (originalRequest ? `本项目用户原始要求：${originalRequest}\n` : '') +
       (sourceRequest ? `触发本任务的用户原话：${sourceRequest.slice(0, 6000)}\n` : '') +
       `用户最近的要求（按时间先后；进度询问不撤销正在执行的任务，停止或限制要求应遵守）：${this.store.getMessages(roomId).filter((m) => m.kind === 'chat' && m.senderId === 'user').slice(-4).map((m) => m.text.slice(0, 2000)).join('\n')}\n` +
       `工作目录：${directory || '（未知）'}\n` +
+      `执行环境：${shell}\n` +
       `命令中文字明确指定的执行目录（未执行命令，变量未求值）：${inspection.directory || '（未知）'}\n` +
       (inspection.preview ? `已读取的脚本/配置（仅作为待审数据，complete=false 表示尚有未读行）：\n${inspection.preview}\n` : '') +
       `申请理由：${reason || '（未说明）'}\n` +
@@ -1454,42 +1496,51 @@ export class Orchestrator {
     reason: string,
     purpose: string,
     signal: AbortSignal,
+    directory: string,
+    shell?: 'bash' | 'cmd',
     runId?: string
-  ): Promise<boolean> {
+  ): Promise<(() => void) | undefined> {
     signal.throwIfAborted()
-    if (agent.access !== 'auto-review') {
-      return this.requestCommandApproval(roomId, command, reason, { agentName: agent.name, signal, runId })
+    const inspection = commandInspection(command, directory, [this.store.getWorkDir()])
+    const shellName = process.platform === 'win32'
+      ? shell !== 'cmd' && findGitBash() ? 'Git Bash' : 'Windows cmd'
+      : '/bin/sh'
+    const execution = { directory, shell: shellName, inspection }
+    const askUser = async (detail: string): Promise<(() => void) | undefined> => {
+      const allowed = await this.requestCommandApproval(roomId, command, `${detail}\n执行环境：${shellName}\n工作目录：${directory}`, {
+        agentName: agent.name, signal, runId
+      })
+      return allowed ? inspection.assertUnchanged : undefined
     }
-    const verdict = await this.reviewCommand(roomId, agent, command, reason, purpose, signal, undefined, runId)
+    if (agent.access !== 'auto-review') {
+      return askUser(reason)
+    }
+    const verdict = await this.reviewCommand(roomId, agent, command, reason, purpose, signal, execution, undefined, runId)
     signal.throwIfAborted()
     if (verdict.decision === 'allow') {
       this.broadcastActivity(roomId, agent, `自动审查通过：${verdict.reason || '与任务相符，低风险'}`)
-      return true
+      return inspection.assertUnchanged
     }
     const room = this.store.getRoom(roomId)
     const manager = this.store.getModerator()
     const managerFinalEnabled = Boolean(room && manager.reviewCommands !== false && moderatorReady(manager))
     if (managerFinalEnabled && !verdict.usedMainModerator) {
       this.broadcastActivity(roomId, agent, '快速审查未放行，交由经理主模型做最终裁决')
-      const reviewed = await this.reviewCommand(roomId, agent, command, reason, purpose, signal, `${verdict.decision}：${verdict.reason}`, runId, true)
+      const reviewed = await this.reviewCommand(roomId, agent, command, reason, purpose, signal, execution, `${verdict.decision}：${verdict.reason}`, runId, true)
       signal.throwIfAborted()
       if (reviewed.decision === 'allow') {
         this.broadcastActivity(roomId, agent, `经理终审通过：${reviewed.reason || '与已授权任务相符，影响范围明确'}`)
-        return true
+        return inspection.assertUnchanged
       }
       this.broadcastActivity(roomId, agent, `经理终审拒绝：${reviewed.reason || '风险过高或不在授权范围'}`)
-      return false
+      return undefined
     }
     if (verdict.decision === 'deny' || managerFinalEnabled) {
       this.broadcastActivity(roomId, agent, `${verdict.usedMainModerator ? '经理终审拒绝' : '自动审查拒绝'}：${verdict.reason || '高风险操作'}`)
-      return false
+      return undefined
     }
     this.broadcastActivity(roomId, agent, `自动审查拿不准，转人工：${verdict.reason || '需要人工确认'}`)
-    return this.requestCommandApproval(roomId, command, `自动审查：${verdict.reason || '需要人工确认'}${reason ? `｜${reason}` : ''}`, {
-      agentName: agent.name,
-      signal,
-      runId
-    })
+    return askUser(`自动审查：${verdict.reason || '需要人工确认'}${reason ? `｜${reason}` : ''}`)
   }
 
   private async executeVisualTool(room: Room, agent: Agent, name: string, args: Record<string, unknown>, signal: AbortSignal): Promise<VisualResult> {
@@ -1616,17 +1667,20 @@ export class Orchestrator {
       if (!workDir) return target.error || '未配置共享工作目录。'
       const cmd = str(args.command)
       if (!cmd) return '请提供 command。'
-      if (agent.access !== 'full') {
-        this.broadcastActivity(room.id, agent, '正在检查命令权限')
-        const ok = await this.requestCommandApprovalSmart(room.id, agent, cmd, str(args.reason), this.purposeForRoom(room.id), signal, mutationOwner)
-        signal.throwIfAborted()
-        if (!ok) return '命令未获批准。可以改用 read_file / list_dir 等只读工具，或说明你要做什么。'
-      }
       const shellRaw = str(args.shell)
       const shellPref = shellRaw === 'cmd' ? 'cmd' : shellRaw === 'bash' ? 'bash' : undefined
+      let verifyApproval: (() => void) | undefined
+      if (agent.access !== 'full') {
+        this.broadcastActivity(room.id, agent, '正在检查命令权限')
+        verifyApproval = await this.requestCommandApprovalSmart(room.id, agent, cmd, str(args.reason), this.purposeForRoom(room.id), signal, workDir, shellPref, mutationOwner)
+        signal.throwIfAborted()
+        if (!verifyApproval) return '命令未获批准。可以改用 read_file / list_dir 等只读工具，或说明你要做什么。'
+      }
+      const timeoutSeconds = Math.min(600, Math.max(10, typeof args.timeoutSeconds === 'number' ? args.timeoutSeconds : 300))
       return await this.withMutationLock(signal, () => {
+        verifyApproval?.()
         this.broadcastActivity(room.id, agent, `执行命令：${cmd}`)
-        return runShellCommand(workDir, cmd, signal, shellPref)
+        return runShellCommand(workDir, cmd, signal, shellPref, timeoutSeconds * 1000)
       }, mutationOwner)
     }
     if (name === 'search_history') {
@@ -1675,8 +1729,10 @@ export class Orchestrator {
       try {
         const files = readdirSync(dir).filter((f) => f.toLowerCase().endsWith('.md')).slice(0, 100)
         return files.map((f) => {
-          const first = readFileSync(join(dir, f), 'utf8').split('\n').find((l) => l.trim())?.trim().slice(0, 120) ?? ''
-          return `${f}${first ? '：' + first : ''}`
+          try {
+            const first = readFileSync(join(dir, f), 'utf8').split('\n').find((l) => l.trim())?.trim().slice(0, 120) ?? ''
+            return `${f}${first ? '：' + first : ''}`
+          } catch { return `${f}（读取失败）` }
         }).join('\n') || '（skills 目录为空）'
       } catch {
         return '（还没有 skills 目录）'
@@ -1767,7 +1823,9 @@ export class Orchestrator {
               const image = await this.executeVisualTool(room, agent, name, args, signal)
               result = image.summary
               pictures.push(visualMessage(image))
-            } else result = name.startsWith('mcp__') ? await mcp.call(name, args) : await this.executeDiscussionTool(room, agent, name, args, signal, undefined, activity?.transfer)
+            } else result = name.startsWith('mcp__')
+              ? await this.withMutationLock(signal, () => mcp.call(name, args))
+              : await this.executeDiscussionTool(room, agent, name, args, signal, undefined, activity?.transfer)
           } catch (e) {
             result = '工具出错：' + (e instanceof Error ? e.message : String(e))
           } finally {
@@ -2226,14 +2284,14 @@ export class Orchestrator {
           session.lastSeenTs = undefined
           session.roomScoped = true
         }
-        const lines = this.historyLines(roomId, agent, session.lastSeenTs)
-        const lastSeenTs = this.store.getMessages(roomId).at(-1)?.ts ?? Date.now()
         const pureChat = isPureChatRoom(room)
+        const lines = this.historyLines(roomId, agent, pureChat ? undefined : session.lastSeenTs)
+        const lastSeenTs = this.store.getMessages(roomId).at(-1)?.ts ?? Date.now()
         const sysPrompt = pureChat ? this.pureChatRules(room, agent) : ''
         const claudeSession = agent.cli?.session === 'claude'
         const prompt = pureChat
           ? (claudeSession ? '' : sysPrompt + '\n\n') +
-            (session.lastSeenTs ? '在你上次发言之后的新消息：\n' : '此前聊天记录：\n') +
+            '此前聊天记录：\n' +
             (lines || '（暂无新消息）') +
             `\n\n请以「${agent.name}」的当前设定与口吻自然接话回复，不要调用任何工作区/文件/命令行工具，也不要使用办公助手或工作汇报口吻。`
           : this.rules(room, agent) +
@@ -2245,7 +2303,7 @@ export class Orchestrator {
             (session.lastSeenTs ? '在你上次发言之后的新消息：\n' : '会议记录节选：\n') +
             (lines || '（暂无新消息，请主动推进讨论）') +
             `\n\n请以「${agent.name}」的身份回答最新用户消息。用户只问进度、原因或概念时，核对必要信息后直接答复。历史中的待办只有在用户要求继续执行时才接着做。用户明确要求你做的事，直接调用工具完成。` + this.handoffNotice(roomId)
-        const r = await runCli(agent, prompt, session.sessionId, onDelta, onStatus, signal, this.store.getWorkDir(), pureChat
+        const r = await runCli(agent, prompt, pureChat ? undefined : session.sessionId, onDelta, onStatus, signal, this.store.getWorkDir(), pureChat
           ? {
             pureChat: true,
             systemPrompt: claudeSession ? sysPrompt : undefined,
@@ -2256,6 +2314,8 @@ export class Orchestrator {
           : {
             autonomous: true,
             agentic: true,
+            lastToolActivity: () => this.bridgeActivity.get(signal)?.lastAt,
+            toolInProgress: () => Boolean(this.bridgeActivity.get(signal)?.pending),
             onModelRate: modelRateObserver(this.broadcast, roomId, agent.name),
             mcpConfig: this.mcpConfigFor(roomId, agent.id),
             onLog: (kind, text) => {

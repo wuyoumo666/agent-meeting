@@ -1,5 +1,22 @@
 import type { WorkSource } from '../shared/types'
 
+export class CommandFailures {
+  private failures = new Map<string, string>()
+
+  record(args: Record<string, unknown>, result: string): string | undefined {
+    const key = JSON.stringify([args.shell === 'cmd' ? 'cmd' : 'bash', String(args.command ?? '').trim()])
+    if (result.startsWith('退出码 0\n')) {
+      this.failures.delete(key)
+      return undefined
+    }
+    const failure = result.split('\n')[0].slice(0, 250) || '命令未返回结果'
+    this.failures.set(key, failure)
+    return failure
+  }
+
+  get unresolved(): string | undefined { return this.failures.values().next().value }
+}
+
 export function webSearchSources(result: string): WorkSource[] {
   try {
     const data = JSON.parse(result) as { results?: Array<{ title?: unknown; url?: unknown }> }

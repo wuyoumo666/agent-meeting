@@ -1,12 +1,13 @@
 import { app } from 'electron'
-import { readFileSync, writeFileSync, renameSync, existsSync, mkdirSync } from 'node:fs'
+import { readFileSync, writeFileSync, renameSync, existsSync, mkdirSync, statSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { randomUUID } from 'node:crypto'
-import type { Agent, AgentSession, AppState, ManagerProject, MemoryRecord, Message, ModelCapabilities, ModeratorConfig, ModeratorUpdate, Provider, ProviderUpdate, Room, RulesFile, ScheduledTask } from '../shared/types'
+import type { Agent, AgentSession, AppState, Attachment, ManagerProject, MemoryRecord, Message, ModelCapabilities, ModeratorConfig, ModeratorUpdate, Provider, ProviderUpdate, Room, RulesFile, ScheduledTask } from '../shared/types'
 import { AGENT_COLORS, CLI_PRESETS, DEFAULT_RULES } from '../shared/types'
 import { readCliModelFromConfig, modelToHandle } from './adapters/cli'
 import { loadRulesFile, saveRulesFile } from './rules'
 import { WindowsCredentials } from './credentials'
+import { decodeInlineImage, storeImage } from './imageAttachments'
 
 interface SessionInfo {
   sessionId?: string
@@ -63,6 +64,7 @@ export class Store {
   private db: Db
   private messagesByRoom = new Map<string, Message[]>()
   private messagesById = new Map<string, Message>()
+  private persistedImages = new WeakMap<Attachment, Attachment>()
   private file: string
   private agentsMd: string
   private skillsDir: string
@@ -293,10 +295,34 @@ export class Store {
     this.flush()
   }
 
+  private persistImage(attachment: Attachment): Attachment {
+    if (attachment?.kind !== 'image' || typeof attachment.dataUrl !== 'string') return attachment
+    const { dataUrl, ...metadata } = attachment
+    try {
+      const cached = this.persistedImages.get(attachment)
+      const saved = cached ? statSync(cached.path, { throwIfNoEntry: false }) : undefined
+      if (cached && saved?.isFile() && saved.size === cached.size) return cached
+      const image = decodeInlineImage(dataUrl)
+      if (!image) return attachment
+      const path = storeImage(join(dirname(this.file), 'attachments'), image.format, image.data)
+      const migrated = { ...metadata, path, size: image.data.length }
+      this.persistedImages.set(attachment, migrated)
+      return migrated
+    } catch {
+      // If the copy cannot be stored, retain the only recoverable image bytes.
+      return attachment
+    }
+  }
+
   private flush(): void {
     mkdirSync(dirname(this.file), { recursive: true })
     const tmp = this.file + '.tmp'
-    writeFileSync(tmp, JSON.stringify(this.db, null, 2), 'utf8')
+    const json = JSON.stringify(this.db, (key, value) => {
+      return key === 'attachments' && Array.isArray(value)
+        ? value.map((attachment: Attachment) => this.persistImage(attachment))
+        : value
+    }, 2)
+    writeFileSync(tmp, json, 'utf8')
     renameSync(tmp, this.file)
   }
 

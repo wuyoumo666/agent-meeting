@@ -131,7 +131,7 @@ export default function App(): React.JSX.Element {
   useEffect(() => {
     return window.api.onEvent((ev) => {
       if (ev.type === 'message') {
-        const unseen = !ev.message.internal && ev.message.senderId !== 'user' && (ev.message.roomId !== roomIdRef.current || document.hidden || !document.hasFocus())
+        const unseen = ev.message.kind === 'chat' && !ev.message.internal && ev.message.senderId !== 'user' && (ev.message.roomId !== roomIdRef.current || document.hidden || !document.hasFocus())
         if (unseen) {
           setUnreadByRoom((u) => ({ ...u, [ev.message.roomId]: (u[ev.message.roomId] ?? 0) + 1 }))
         }
